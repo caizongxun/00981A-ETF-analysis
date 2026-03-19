@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 00981A 全期歷史持股下載
+
+重點：每期同時儲存
+  - 候選池內全部股票 (in_etf=0 或 in_etf=1)
+  - 讓分類器同時看到兩個類別
+
 執行： python data/fetch_history.py
 """
 import requests
@@ -34,27 +39,20 @@ HEADERS_BASE = {
     "Referer": "https://www.pocket.tw/etf/tw/00981A/fundholding",
 }
 
-# ── 直接嘗試 .TW 和 .TWO，找到有股價的那個 ──
-_SUFFIX_CACHE: dict[str, str] = {}
+_SUFFIX_CACHE: dict = {}
 
-def get_valid_symbol(stock_id: str) -> tuple[str, str] | None:
-    """
-    回傳 (symbol, suffix) 或 None
-    """
+def get_valid_symbol(stock_id: str):
     if stock_id in _SUFFIX_CACHE:
         s = _SUFFIX_CACHE[stock_id]
-        return (f"{stock_id}{s}", s)
-
+        return (f"{stock_id}{s}", s) if s else None
     for suffix in (".TW", ".TWO"):
-        sym = f"{stock_id}{suffix}"
         try:
-            hist = yf.Ticker(sym).history(period="5d")
+            hist = yf.Ticker(f"{stock_id}{suffix}").history(period="5d")
             if not hist.empty:
                 _SUFFIX_CACHE[stock_id] = suffix
-                return (sym, suffix)
+                return (f"{stock_id}{suffix}", suffix)
         except:
             pass
-    # 兩個都失敗
     _SUFFIX_CACHE[stock_id] = None
     return None
 
@@ -66,72 +64,54 @@ def fetch_holdings_by_date(query_date: str, cookie: str) -> list[dict]:
         f"&ParamStr=AssignID%3D00981A%3BQueryDate%3D{query_date}%3B"
         "&FilterNo=0"
     )
-    h = {**HEADERS_BASE, "Cookie": cookie}
-    r = requests.get(url, headers=h, timeout=20)
+    r = requests.get(url, headers={**HEADERS_BASE, "Cookie": cookie}, timeout=20)
     r.raise_for_status()
-    data = json.loads(r.text)
-    rows = data.get("Data", [])
+    rows = json.loads(r.text).get("Data", [])
     result = []
     for row in rows:
-        if len(row) < 3:
-            continue
-        sid = str(row[1]).strip()
-        if not re.match(r'^\d{4,6}$', sid):
+        sid = str(row[1]).strip() if len(row) > 1 else ""
+        if not re.match(r'^[2-9]\d{3}$', sid):
             continue
         result.append({
-            "api_date":   str(row[0]),
             "stock_id":   sid,
-            "stock_name": str(row[2]).strip(),
+            "stock_name": str(row[2]).strip() if len(row) > 2 else "",
             "weight":     float(row[3]) if len(row) > 3 else 0.0,
-            "shares":     str(row[4]) if len(row) > 4 else "",
         })
     return result
 
 
-def get_features_for_period(candidate_pool: set, holding_ids: set, period: str) -> pd.DataFrame:
-    records = []
-    total   = len(candidate_pool)
-    for i, tk in enumerate(sorted(candidate_pool), 1):
-        result = get_valid_symbol(tk)
-        if result is None:
-            print(f"    [{i}/{total}] {tk} [SKIP] 兩個後綴都無股價")
-            continue
-        sym, suffix = result
-        print(f"    [{i}/{total}] {sym}", end=" ", flush=True)
-        try:
-            t      = yf.Ticker(sym)
-            info   = t.info
-            hist   = t.history(period="9mo")
-            if hist.empty:
-                print("[SKIP]")
-                continue
-            closes = hist["Close"]
-            mom3  = (closes.iloc[-1] / closes.iloc[-63]  - 1) if len(closes) >= 63  else np.nan
-            mom6  = (closes.iloc[-1] / closes.iloc[-126] - 1) if len(closes) >= 126 else np.nan
-            vol60 = closes.pct_change().tail(60).std() * np.sqrt(252)
-            records.append({
-                "stock_id":         tk,
-                "industry":         INDUSTRY_MAP.get(tk, "不明"),
-                "roe":              info.get("returnOnEquity",   np.nan),
-                "pe_ratio":         info.get("trailingPE",       np.nan),
-                "pb_ratio":         info.get("priceToBook",      np.nan),
-                "gross_margin":     info.get("grossMargins",     np.nan),
-                "operating_margin": info.get("operatingMargins", np.nan),
-                "debt_to_equity":   info.get("debtToEquity",     np.nan),
-                "market_cap":       info.get("marketCap",        np.nan),
-                "price_mom_3m":     mom3,
-                "price_mom_6m":     mom6,
-                "volatility_60d":   vol60,
-                "in_etf":           int(tk in holding_ids),
-                "period":           period,
-            })
-            print("OK")
-        except Exception as e:
-            print(f"[ERR] {e}")
-    df = pd.DataFrame(records)
-    if not df.empty:
-        df["market_cap_rank"] = df["market_cap"].rank(ascending=False)
-    return df
+def get_features_one(tk: str) -> dict | None:
+    """\u53d6得單一股票特徵，失敗回傳 None"""
+    result = get_valid_symbol(tk)
+    if result is None:
+        return None
+    sym, _ = result
+    try:
+        t      = yf.Ticker(sym)
+        info   = t.info
+        hist   = t.history(period="9mo")
+        if hist.empty:
+            return None
+        closes = hist["Close"]
+        mom3  = (closes.iloc[-1] / closes.iloc[-63]  - 1) if len(closes) >= 63  else np.nan
+        mom6  = (closes.iloc[-1] / closes.iloc[-126] - 1) if len(closes) >= 126 else np.nan
+        vol60 = closes.pct_change().tail(60).std() * np.sqrt(252)
+        return {
+            "stock_id":         tk,
+            "industry":         INDUSTRY_MAP.get(tk, "不明"),
+            "roe":              info.get("returnOnEquity",   np.nan),
+            "pe_ratio":         info.get("trailingPE",       np.nan),
+            "pb_ratio":         info.get("priceToBook",      np.nan),
+            "gross_margin":     info.get("grossMargins",     np.nan),
+            "operating_margin": info.get("operatingMargins", np.nan),
+            "debt_to_equity":   info.get("debtToEquity",     np.nan),
+            "market_cap":       info.get("marketCap",        np.nan),
+            "price_mom_3m":     mom3,
+            "price_mom_6m":     mom6,
+            "volatility_60d":   vol60,
+        }
+    except:
+        return None
 
 
 if __name__ == "__main__":
@@ -140,12 +120,10 @@ if __name__ == "__main__":
         exit(1)
     cookie = COOKIE_FILE.read_text(encoding="utf-8").strip()
 
-    # ── Step 1: 下載所有月份持股 ──
+    # Step 1: 下載所有月份持股
     START = date(2025, 6, 1)
     END   = date.today().replace(day=1)
-
-    raw_records     = []
-    period_holdings = {}
+    period_holdings = {}   # period -> set of stock_id (in_etf=1)
 
     cur = START
     while cur <= END:
@@ -157,16 +135,9 @@ if __name__ == "__main__":
             if not rows:
                 rows = fetch_holdings_by_date(cur.replace(day=15).strftime("%Y%m%d"), cookie)
             if rows:
-                # 只保留電子/科技相關股（2xxx~8xxx）
-                ids = {
-                    r["stock_id"] for r in rows
-                    if re.match(r'^[2-9]\d{3}$', r["stock_id"])
-                }
-                print(f"{len(ids)} 支")
+                ids = {r["stock_id"] for r in rows}
+                print(f"{len(ids)} 支入選")
                 period_holdings[period] = ids
-                for r in rows:
-                    if r["stock_id"] in ids:
-                        raw_records.append({"period": period, **r})
             else:
                 print("無資料")
         except Exception as e:
@@ -174,52 +145,73 @@ if __name__ == "__main__":
         cur += relativedelta(months=1)
         time.sleep(0.5)
 
-    raw_df = pd.DataFrame(raw_records)
-    raw_path = DATA_DIR / "real_holdings_raw.csv"
-    raw_df.to_csv(raw_path, index=False, encoding="utf-8-sig")
-    print(f"\n原始持股已存: {raw_path} ({len(raw_df)} 筆, {raw_df['period'].nunique()} 期)")
-
     if not period_holdings:
         print("[ERROR] 沒有資料")
         exit(1)
 
-    # 候選池 = 所有期出現過
+    # Step 2: 建候選池 (所有期入選過的聯集)
     candidate_pool = set()
     for ids in period_holdings.values():
         candidate_pool.update(ids)
     print(f"\n候選池: {len(candidate_pool)} 支")
 
-    # 預先建立 suffix cache（會自動嘗試 .TW 再試 .TWO）
-    print("\n確認候選池股票後綴...(TW/TWO)")
+    # Step 3: 確認 suffix cache
+    print("\n確認股票後綴...")
     valid_pool = set()
     for tk in sorted(candidate_pool):
         result = get_valid_symbol(tk)
         if result:
-            print(f"  {tk} -> {result[0]} [OK]")
             valid_pool.add(tk)
+            print(f"  {tk} -> {result[0]} [OK]")
         else:
-            print(f"  {tk} -> [SKIP] Yahoo 無資料")
+            print(f"  {tk} -> [SKIP]")
+        time.sleep(0.2)
+    print(f"有效候選池: {len(valid_pool)} 支")
+
+    # Step 4: 每期取得對候選池內所有股票的特徵 (in_etf=0 AND 1)
+    # 特徵只取一次，各期共用（因為 yfinance 只有最新資料）
+    print("\n取得 yfinance 特徵（各股票取一次）...")
+    feat_base = {}  # stock_id -> feature dict
+    total = len(valid_pool)
+    for i, tk in enumerate(sorted(valid_pool), 1):
+        print(f"  [{i}/{total}] {tk}", end=" ", flush=True)
+        feat = get_features_one(tk)
+        if feat:
+            feat_base[tk] = feat
+            print("OK")
+        else:
+            print("[SKIP]")
         time.sleep(0.3)
 
-    print(f"\n有效候選池: {len(valid_pool)} 支 ({len(candidate_pool)-len(valid_pool)} 支無股價已移除)")
-
-    # ── Step 2: 特徵 ──
-    print("\n取得 yfinance 特徵...")
-    all_dfs = []
+    # Step 5: 對每期組合持股標籤 (in_etf)
+    all_rows = []
     for period, holding_ids in sorted(period_holdings.items()):
-        # 將 holding_ids 也過濾為 valid_pool 內的
-        valid_holding = holding_ids & valid_pool
-        print(f"\n  [{period}] 入選 {len(valid_holding)} 支: {sorted(valid_holding)}")
-        df = get_features_for_period(valid_pool, valid_holding, period)
-        if not df.empty:
-            all_dfs.append(df)
-        time.sleep(1)
+        valid_holding = holding_ids & set(feat_base.keys())
+        for tk, feat in feat_base.items():
+            row = {
+                **feat,
+                "in_etf": int(tk in valid_holding),
+                "period":  period,
+            }
+            all_rows.append(row)
 
-    if all_dfs:
-        full = pd.concat(all_dfs, ignore_index=True)
-        hist_path = DATA_DIR / "holdings_history.csv"
-        full.to_csv(hist_path, index=False, encoding="utf-8-sig")
-        print(f"\n完成! holdings_history.csv ({len(full)} 筆, {full['period'].nunique()} 期)")
-        print("接下來執行: python backtest/walk_forward.py")
-    else:
-        print("[ERROR] 特徵取得失敗")
+        n1 = sum(1 for tk in feat_base if tk in valid_holding)
+        n0 = len(feat_base) - n1
+        print(f"  [{period}] in_etf=1: {n1} 支, in_etf=0: {n0} 支")
+
+    full = pd.DataFrame(all_rows)
+    full["market_cap_rank"] = full.groupby("period")["market_cap"].rank(ascending=False)
+
+    # 儲存原始持股
+    raw_rows = []
+    for period, ids in period_holdings.items():
+        for sid in ids:
+            raw_rows.append({"period": period, "stock_id": sid})
+    pd.DataFrame(raw_rows).to_csv(DATA_DIR / "real_holdings_raw.csv",
+                                  index=False, encoding="utf-8-sig")
+
+    hist_path = DATA_DIR / "holdings_history.csv"
+    full.to_csv(hist_path, index=False, encoding="utf-8-sig")
+    print(f"\n完成! holdings_history.csv ({len(full)} 筆, {full['period'].nunique()} 期)")
+    print(f"in_etf 分布: {full['in_etf'].value_counts().to_dict()}")
+    print("接下來執行: python backtest/walk_forward.py")
