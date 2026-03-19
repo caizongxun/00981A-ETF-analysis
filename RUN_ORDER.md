@@ -1,5 +1,7 @@
 # 執行順序說明
 
+> 所有指令都從 **專案根目錄** (`00981A-ETF-analysis/`) 執行
+
 ## 環境安裝
 
 ```bash
@@ -25,7 +27,8 @@ python analysis/fetch_holdings.py
 python analysis/feature_engineering.py
 ```
 
-- 對每支持股計算 ROE、PE、動能、波動率等 10 個特徵
+- 自動建立 `data/` 資料夾
+- 對每支股票自動測試 `.TW` / `.TWO` 後綴
 - 輸出：`data/features.csv`
 
 ---
@@ -36,20 +39,15 @@ python analysis/feature_engineering.py
 python model/stock_selector.py
 ```
 
-- 以 features.csv + holdings_sample.csv 訓練 Random Forest 分類器
 - 輸出：`data/rf_model.pkl`、`data/scaler.pkl`、`data/feature_importance.png`
-- CV AUC 分數會印出，確認模型有學到東西
 
 ---
 
-## Step 4 — 選股邏輯分析
+## Step 4 — 選股邏輯分析（可選）
 
 ```bash
 python analysis/pattern_analysis.py
 ```
-
-- 統計分析成分股 vs 非成分股的特徵差異（t-test）
-- 輸出：`data/industry_distribution.png`
 
 ---
 
@@ -59,31 +57,16 @@ python analysis/pattern_analysis.py
 python backtest/backtest.py
 ```
 
-- 載入訓練好的模型，模擬每月換股買賣
-- **買進邏輯**：模型預測機率 ≥ 0.5 的前 10 支股票，等權重買進
-- **賣出邏輯**：每月換股日全數賣出，重新選股買進
-- 輸出：
-  - `data/backtest_nav.png` — 策略 vs 大盤累積淨值走勢圖
-  - `data/trade_log.csv` — 完整交易紀錄
-  - 終端機印出：總報酬率、年化報酬率、Sharpe Ratio、最大回撤
+- 輸出：`data/backtest_nav.png`、`data/trade_log.csv`
+- 終端列出：總報酬率、年化報酬、Sharpe、最大回撤、Alpha vs 0050
 
 ---
 
-## 資料流圖
+## 常見錯誤處理
 
-```
-fetch_holdings.py
-       ↓
-  data/raw/*.csv
-       ↓
-feature_engineering.py
-       ↓
-  data/features.csv
-       ↓
- stock_selector.py → data/rf_model.pkl
-                           ↓
-                    backtest.py
-                           ↓
-               data/backtest_nav.png
-               data/trade_log.csv
-```
+| 錯誤 | 原因 | 解決 |
+|------|------|------|
+| `OSError: non-existent directory` | 舊版路徑問題 | 已修正，自動建立 data/ |
+| `Quote not found 3691.TW` | 上櫃小市場用 .TWO | 已修正，自動測試後綴 |
+| `FileNotFoundError features.csv` | 尚未執行 Step 2 | 先執行 feature_engineering.py |
+| `[ERROR] 找不到模型` | 尚未執行 Step 3 | 先執行 stock_selector.py |
