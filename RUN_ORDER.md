@@ -2,71 +2,59 @@
 
 > 所有指令都從 **專案根目錄** (`00981A-ETF-analysis/`) 執行
 
-## 環境安裝
+---
+
+## 《方案 A》 基礎回測（已完成）
 
 ```bash
 pip install -r requirements.txt
+python analysis/feature_engineering.py   # Step 2
+python model/stock_selector.py           # Step 3
+python backtest/backtest.py              # Step 5
 ```
 
 ---
 
-## Step 1 — 爬取持股明細
+## 《方案 B》 Walk-Forward OOS 回測（近似真實）
+
+### Step 1 — 生成多期持股快照（需要一段時間）
 
 ```bash
-python analysis/fetch_holdings.py
+python data/generate_synthetic_holdings.py
 ```
 
-- 爬取 00981A 每日持股明細
-- 輸出：`data/raw/holdings_YYYY-MM-DD.csv`
+- 自動模擬 9 個月的持股變化資料
+- 輸出：`data/holdings_history.csv`
 
----
-
-## Step 2 — 計算特徵矩陣
+### Step 2 — Walk-Forward 驗證
 
 ```bash
-python analysis/feature_engineering.py
+python backtest/walk_forward.py
 ```
 
-- 自動建立 `data/` 資料夾
-- 對每支股票自動測試 `.TW` / `.TWO` 後綴
-- 輸出：`data/features.csv`
+- 每期只用「當期之前」資料訓練，預測下一期（模型從未見過該期）
+- 輸出：
+  - `data/walk_forward_result.png` — NAV 走勢 + AUC 比較圖
+  - `data/oos_results.csv` — 各期 OOS AUC 、入選股票
+  - `data/wf_trade_log.csv` — 交易紀錄
 
 ---
 
-## Step 3 — 訓練選股模型
+## 如何判斷結果可信度
 
-```bash
-python model/stock_selector.py
-```
-
-- 輸出：`data/rf_model.pkl`、`data/scaler.pkl`、`data/feature_importance.png`
-
----
-
-## Step 4 — 選股邏輯分析（可選）
-
-```bash
-python analysis/pattern_analysis.py
-```
-
----
-
-## Step 5 — 回測
-
-```bash
-python backtest/backtest.py
-```
-
-- 輸出：`data/backtest_nav.png`、`data/trade_log.csv`
-- 終端列出：總報酬率、年化報酬、Sharpe、最大回撤、Alpha vs 0050
-
----
+| 指標 | 代表意義 |
+|------|----------|
+| OOS AUC > 0.6 | 模型對未見資料有預測力 |
+| 訓練 AUC - OOS AUC < 0.15 | 沒有明顯過擬合 |
+| Sharpe > 1.0 | 風險調整後報酬尚可 |
+| 最大回撤 < -20% | 需加止損機制 |
 
 ## 常見錯誤處理
 
-| 錯誤 | 原因 | 解決 |
-|------|------|------|
-| `OSError: non-existent directory` | 舊版路徑問題 | 已修正，自動建立 data/ |
-| `Quote not found 3691.TW` | 上櫃小市場用 .TWO | 已修正，自動測試後綴 |
-| `FileNotFoundError features.csv` | 尚未執行 Step 2 | 先執行 feature_engineering.py |
-| `[ERROR] 找不到模型` | 尚未執行 Step 3 | 先執行 stock_selector.py |
+| 錯誤 | 解決 |
+|------|------|
+| `OSError: non-existent directory` | 已修正，自動建立 data/ |
+| `Quote not found 3691.TW` | 上櫃小市場用 .TWO，已修正 |
+| `FileNotFoundError features.csv` | 尚未執行 Step 2 |
+| `[ERROR] 找不到模型` | 尚未執行 stock_selector.py |
+| `[ERROR] 找不到 holdings_history.csv` | 尚未執行 generate_synthetic_holdings.py |
