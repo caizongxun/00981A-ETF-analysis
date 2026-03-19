@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""
-回測模組：載入訓練好的模型，模擬每月換股買賣
-執行方式： python backtest/backtest.py
-"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 import numpy as np
@@ -11,13 +10,14 @@ import pickle
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from pathlib import Path
+from utils.font_helper import setup_font
+
+setup_font()
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-# ─ 參數 ────────────────────────────────────────────
 START_DATE   = "2025-06-01"
 END_DATE     = "2026-03-01"
 INITIAL_CASH = 1_000_000
@@ -40,7 +40,6 @@ FEATURE_COLS = [
     "market_cap_rank"
 ]
 
-# ─ 工具 ────────────────────────────────────────────
 def get_valid_ticker_obj(stock_id):
     for suffix in [".TW", ".TWO"]:
         t = yf.Ticker(f"{stock_id}{suffix}")
@@ -59,8 +58,8 @@ def get_features(tickers):
         if t is None:
             continue
         try:
-            info  = t.info
-            hist  = t.history(period="9mo")
+            info   = t.info
+            hist   = t.history(period="9mo")
             closes = hist["Close"]
             mom3  = (closes.iloc[-1] / closes.iloc[-63]  - 1) if len(closes) >= 63  else np.nan
             mom6  = (closes.iloc[-1] / closes.iloc[-126] - 1) if len(closes) >= 126 else np.nan
@@ -82,9 +81,8 @@ def get_features(tickers):
         except Exception as e:
             print(f"  [WARN] {tk}: {e}")
     df = pd.DataFrame(records)
-    if df.empty:
-        return df
-    df["market_cap_rank"] = df["market_cap"].rank(ascending=False)
+    if not df.empty:
+        df["market_cap_rank"] = df["market_cap"].rank(ascending=False)
     return df
 
 def download_prices(tickers):
@@ -101,7 +99,6 @@ def download_prices(tickers):
                 pass
     return pd.DataFrame(price_dict).ffill()
 
-# ─ 回測引擎 ──────────────────────────────────────────
 class Backtester:
     def __init__(self, model, scaler):
         self.model    = model
@@ -126,7 +123,7 @@ class Backtester:
             if pd.isna(p):
                 continue
             self.cash += shares * p * (1 - TAX_RATE - TRANS_COST)
-            self.trade_log.append((date, "SELL", tk, shares, round(p, 2)))
+            self.trade_log.append((date, "SELL", tk, shares, round(float(p), 2)))
         self.holdings = {}
 
     def _buy_equal(self, tickers, price_row, date):
@@ -135,7 +132,7 @@ class Backtester:
             return
         alloc = self.cash / len(valid)
         for tk in valid:
-            p = price_row[tk]
+            p = float(price_row[tk])
             shares = int(alloc * (1 - TRANS_COST) / p)
             if shares <= 0:
                 continue
@@ -145,69 +142,60 @@ class Backtester:
 
     def calc_nav(self, price_row, date):
         nav = self.cash + sum(
-            sh * price_row.get(tk, 0)
+            sh * float(price_row.get(tk, 0))
             for tk, sh in self.holdings.items()
         )
         self.nav_history.append({"date": date, "nav": nav})
         return nav
 
     def run(self, price_df):
-        rebalance_dates = pd.date_range(START_DATE, END_DATE, freq="MS")  # 每月第一日
+        rebalance_dates = pd.date_range(START_DATE, END_DATE, freq="MS")
         print(f"回測期間: {START_DATE} ~ {END_DATE}")
-
         for rb_date in rebalance_dates:
             date_str = rb_date.strftime("%Y-%m-%d")
             avail = price_df.index[price_df.index <= rb_date]
             if avail.empty:
                 continue
             price_row = price_df.loc[avail[-1]].to_dict()
-
             self._sell_all(price_row, date_str)
-
             print(f"[{date_str}] 取得特徵中...", end=" ", flush=True)
             feat_df     = get_features(CANDIDATE_POOL)
             top_tickers = self._predict_top_n(feat_df)
             print(f"入選: {top_tickers}")
-
             self._buy_equal(top_tickers, price_row, date_str)
             nav = self.calc_nav(price_row, date_str)
             print(f"  NAV: {nav:,.0f} 元  現金: {self.cash:,.0f} 元")
-
         return pd.DataFrame(self.nav_history).set_index("date")
 
-# ─ 績效計算 ──────────────────────────────────────────
 def calc_performance(nav_df):
-    ret = nav_df["nav"].pct_change().dropna()
+    ret    = nav_df["nav"].pct_change().dropna()
     total  = nav_df["nav"].iloc[-1] / nav_df["nav"].iloc[0] - 1
-    annual = (1 + total) ** (12 / len(nav_df)) - 1  # 按月計
+    annual = (1 + total) ** (12 / max(len(nav_df), 1)) - 1
     sharpe = ret.mean() / ret.std() * np.sqrt(12) if ret.std() > 0 else 0
     max_dd = (nav_df["nav"] / nav_df["nav"].cummax() - 1).min()
-
     print("\n====== 回測績效 ======")
     print(f"總報酬率   : {total*100:.2f}%")
     print(f"年化報酬率  : {annual*100:.2f}%")
     print(f"Sharpe Ratio: {sharpe:.3f}")
     print(f"最大回撤    : {max_dd*100:.2f}%")
-
     try:
-        bm = yf.download("0050.TW", start=START_DATE, end=END_DATE,
-                         progress=False, auto_adjust=True)["Close"]
-        bm_ret = (bm.iloc[-1] / bm.iloc[0] - 1) * 100
+        bm     = yf.download("0050.TW", start=START_DATE, end=END_DATE,
+                             progress=False, auto_adjust=True)["Close"]
+        bm_ret = (float(bm.iloc[-1]) / float(bm.iloc[0]) - 1) * 100
         print(f"大盤(0050)報酬: {bm_ret:.2f}%")
-        alpha = total * 100 - float(bm_ret)
-        print(f"Alpha       : {alpha:.2f}%")
+        print(f"Alpha       : {total*100 - bm_ret:.2f}%")
     except Exception:
         pass
 
 def plot_nav(nav_df):
     nav_norm = nav_df["nav"] / nav_df["nav"].iloc[0] * 100
-    fig, ax = plt.subplots(figsize=(12, 5))
+    fig, ax  = plt.subplots(figsize=(12, 5))
     ax.plot(nav_norm.index, nav_norm.values, label="策略 NAV", linewidth=2, color="steelblue")
     ax.axhline(100, color="gray", linestyle="--", alpha=0.5, label="起始基準")
     ax.fill_between(nav_norm.index, 100, nav_norm.values,
                     where=(nav_norm.values >= 100), alpha=0.15, color="green")
     ax.fill_between(nav_norm.index, 100, nav_norm.values,
-                    where=(nav_norm.values < 100), alpha=0.15, color="red")
+                    where=(nav_norm.values < 100),  alpha=0.15, color="red")
     ax.set_title("00981A 選股策略 回測 NAV")
     ax.set_ylabel("累積淨值 (起始=100)")
     ax.legend()
@@ -216,28 +204,21 @@ def plot_nav(nav_df):
     plt.savefig(out, dpi=150)
     print(f"NAV 圖已存: {out}")
 
-# ─ 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
     model_path  = DATA_DIR / "rf_model.pkl"
     scaler_path = DATA_DIR / "scaler.pkl"
-
     if not model_path.exists():
         print("[ERROR] 找不到模型，請先執行: python model/stock_selector.py")
         exit(1)
-
     with open(model_path,  "rb") as f: model  = pickle.load(f)
     with open(scaler_path, "rb") as f: scaler = pickle.load(f)
-
     print("下載候選股歷史股價...")
     price_df = download_prices(CANDIDATE_POOL)
     print(f"取得 {len(price_df.columns)} 支股票的歷史股價")
-
-    bt = Backtester(model, scaler)
+    bt     = Backtester(model, scaler)
     nav_df = bt.run(price_df)
-
     calc_performance(nav_df)
     plot_nav(nav_df)
-
     trade_df = pd.DataFrame(bt.trade_log,
                             columns=["date", "action", "ticker", "shares", "price"])
     out = DATA_DIR / "trade_log.csv"

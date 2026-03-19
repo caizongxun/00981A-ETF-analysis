@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""
-訓練 Random Forest 選股模型，訓練完存出 .pkl 供回測使用
-執行方式： python model/stock_selector.py
-"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 import numpy as np
@@ -10,10 +9,12 @@ import pickle
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
+from utils.font_helper import setup_font
+
+setup_font()
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -39,7 +40,6 @@ def prepare_dataset():
 def train_and_save(X, y):
     scaler = StandardScaler()
     X_sc   = scaler.fit_transform(X)
-
     rf = RandomForestClassifier(
         n_estimators=300, max_depth=6,
         class_weight="balanced", random_state=42
@@ -47,10 +47,9 @@ def train_and_save(X, y):
     if len(np.unique(y)) >= 2 and y.sum() >= 2:
         cv = StratifiedKFold(n_splits=min(5, int(y.sum())), shuffle=True, random_state=42)
         scores = cross_val_score(rf, X_sc, y, cv=cv, scoring="roc_auc")
-        print(f"CV AUC: {scores.mean():.4f} ± {scores.std():.4f}")
+        print(f"CV AUC: {scores.mean():.4f} \u00b1 {scores.std():.4f}")
     else:
         print("[WARN] 正樣本過少，跳過交叉驗證")
-
     rf.fit(X_sc, y)
     with open(DATA_DIR / "rf_model.pkl",  "wb") as f: pickle.dump(rf, f)
     with open(DATA_DIR / "scaler.pkl",    "wb") as f: pickle.dump(scaler, f)
@@ -61,7 +60,7 @@ def plot_feature_importance(model):
     imp = model.feature_importances_
     idx = np.argsort(imp)[::-1]
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(range(len(imp)), imp[idx])
+    ax.bar(range(len(imp)), imp[idx], color="steelblue")
     ax.set_xticks(range(len(imp)))
     ax.set_xticklabels([FEATURE_COLS[i] for i in idx], rotation=45, ha="right")
     ax.set_title("00981A 選股特徵重要性")
