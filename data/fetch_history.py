@@ -1,222 +1,196 @@
 #!/usr/bin/env python3
 """
-歷史持股資料查詢工具
+00981A 全期歷史持股下載
 
-來源 1： 公開資訊觀測站 (MOPS) - 基金每月公布
-來源 2： Wayback Machine - 對 pocket.tw 登錄項快照
-來源 3： 統一投信 API 片段日期查詢
+已驗證可用 API：
+  pocket.tw 帶 QueryDate 參數可查歷史日期，每期 58 筆
 
 執行： python data/fetch_history.py
+輸出： data/real_holdings_raw.csv + data/holdings_history.csv
 """
 import requests
 import pandas as pd
+import numpy as np
+import yfinance as yf
 import json
-import re
 import time
+import re
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date
 from dateutil.relativedelta import relativedelta
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 COOKIE_FILE = ROOT / ".cookie"
 
-HEADERS = {
+INDUSTRY_MAP = {
+    "2330": "半導體", "4552": "通訊網路", "2308": "電子零組件", "6669": "電腦週邊",
+    "2368": "電子零組件", "2383": "電子零組件", "2454": "半導體", "3008": "光電",
+    "2317": "電腦週邊", "2382": "電腦週邊", "3711": "通訊網路", "2357": "電腦週邊",
+    "2379": "半導體", "3691": "電子零組件", "8299": "半導體",
+    "6274": "電子零組件", "6223": "半導體", "5274": "半導體",
+    "3017": "電子零組件", "3653": "電子零組件", "2345": "通訊網路",
+    "3037": "半導體", "3665": "電子零組件",
+}
+
+HEADERS_BASE = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.pocket.tw/etf/tw/00981A/fundholding",
 }
 
 
-# ===========================================================
-# 來源 1： 公開資訊觀測站 MOPS - 基金持股公告
-# 00981A 每季公布前10大持股，公開資訊為公開信訊
-# ===========================================================
-def fetch_mops_holdings(year: int, season: int) -> list[dict]:
-    """
-    year: 民國年份（ex: 113 = 2024）
-    season: 1~4
-    回傳 [{stock_id, stock_name, weight}, ...]
-    """
-    url = "https://mops.twse.com.tw/mops/web/ajax_t138sb05"
-    payload = {
-        "encodeURIComponent": "1",
-        "step": "1",
-        "firstin": "1",
-        "off": "1",
-        "queryName": "co_id",
-        "inpuType": "co_id",
-        "TYPEK": "all",
-        "isnew": "false",
-        "co_id": "00981A",
-        "year": str(year),
-        "season": str(season),
-    }
-    headers = {
-        **HEADERS,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": "https://mops.twse.com.tw/mops/web/t138sb05",
-    }
-    try:
-        r = requests.post(url, data=payload, headers=headers, timeout=20)
-        tables = pd.read_html(r.text)
-        for t in tables:
-            cols = list(t.columns)
-            # 找含股票代號的表
-            if any("代號" in str(c) or "證券" in str(c) for c in cols):
-                print(f"  [MOPS] {year}Q{season} 找到表格: {cols[:5]}")
-                return t.to_dict("records")
-    except Exception as e:
-        print(f"  [MOPS] {year}Q{season} 失敗: {e}")
-    return []
-
-
-# ===========================================================
-# 來源 2： Wayback Machine CDX API
-# 查詢 pocket.tw 是否有對應日期的快照
-# ===========================================================
-def list_wayback_snapshots(url_pattern: str, start: str, end: str) -> list[dict]:
-    """
-    回傳指定期間內所有快照列表
-    start/end: 'YYYYMMDD'
-    """
-    cdx_url = (
-        f"https://web.archive.org/cdx/search/cdx"
-        f"?url={url_pattern}&output=json&fl=timestamp,statuscode"
-        f"&from={start}&to={end}&limit=50&collapse=timestamp:6"
-    )
-    try:
-        r = requests.get(cdx_url, timeout=20)
-        rows = json.loads(r.text)
-        if len(rows) <= 1:
-            return []
-        return [{"timestamp": row[0], "status": row[1]} for row in rows[1:]]
-    except Exception as e:
-        print(f"  [Wayback CDX] 失敗: {e}")
-        return []
-
-
-def fetch_wayback_snapshot(timestamp: str, original_url: str, cookie: str = "") -> str:
-    """抓取指定時間點的快照內容"""
-    url = f"https://web.archive.org/web/{timestamp}/{original_url}"
-    h = {**HEADERS}
-    if cookie:
-        h["Cookie"] = cookie
-    try:
-        r = requests.get(url, headers=h, timeout=30)
-        return r.text
-    except Exception as e:
-        print(f"  [Wayback] {timestamp} 失敗: {e}")
-        return ""
-
-
-def try_wayback_pocket(cookie: str = "") -> list[dict]:
-    """
-    嘗試從 Wayback Machine 抓取 pocket.tw 的持股快照
-    由於 pocket.tw 為動態頁面，成功率低但尝試看看
-    """
-    TARGET = "https://www.pocket.tw/etf/tw/00981A/fundholding"
-    API_TARGET = (
-        "https://www.pocket.tw/api/cm/MobileService/ashx/GetDtnoData.ashx"
-        "?action=getdtnodata&DtNo=59449513*"
-    )
-    print("  查詢 Wayback Machine 快照...")
-
-    # 查詢 API 端點快照（更可能有用）
-    snapshots = list_wayback_snapshots(API_TARGET, "20250501", "20260319")
-    print(f"  API 快照數: {len(snapshots)}")
-    for s in snapshots[:5]:
-        print(f"    {s['timestamp']} status={s['status']}")
-
-    return snapshots
-
-
-# ===========================================================
-# 來源 3： 統一投信官方 - 嘗試帶日期參數查詢
-# ===========================================================
-def fetch_upamc_by_date(query_date: str, cookie: str = "") -> list[dict]:
+def fetch_holdings_by_date(query_date: str, cookie: str) -> list[dict]:
     """
     query_date: 'YYYYMMDD'
-    統一投信內部可能支援指定日期查詢
+    回傳 [{date, stock_id, stock_name, weight, shares}, ...]
     """
-    # 嘗試將日期夸入 MTPeriod 參數
-    # MTPeriod 對應的可能是 Unix timestamp 或序號
-    year  = query_date[:4]
-    month = query_date[4:6]
-    day   = query_date[6:8]
+    url = (
+        "https://www.pocket.tw/api/cm/MobileService/ashx/GetDtnoData.ashx"
+        "?action=getdtnodata&DtNo=59449513"
+        f"&ParamStr=AssignID%3D00981A%3BQueryDate%3D{query_date}%3B"
+        "&FilterNo=0"
+    )
+    h = {**HEADERS_BASE, "Cookie": cookie}
+    r = requests.get(url, headers=h, timeout=20)
+    r.raise_for_status()
+    data = json.loads(r.text)
+    rows = data.get("Data", [])
+    result = []
+    for row in rows:
+        if len(row) < 3:
+            continue
+        sid = str(row[1]).strip()
+        if not re.match(r'^\d{4,6}$', sid):
+            continue
+        result.append({
+            "api_date":   str(row[0]),
+            "stock_id":   sid,
+            "stock_name": str(row[2]).strip(),
+            "weight":     float(row[3]) if len(row) > 3 else 0.0,
+            "shares":     str(row[4]) if len(row) > 4 else "",
+        })
+    return result
 
-    urls = [
-        # 嘗試從統一投信官方 API 帶日期查詢
-        f"https://www.upamc.com.tw/api/etf/holding?code=00981A&date={year}{month}{day}",
-        f"https://api.upamc.com.tw/ETF/GetETFHolding?FundCode=00981A&Date={year}{month}{day}",
-        # pocket.tw 嘗試帶日期
-        (
-            f"https://www.pocket.tw/api/cm/MobileService/ashx/GetDtnoData.ashx"
-            f"?action=getdtnodata&DtNo=59449513"
-            f"&ParamStr=AssignID%3D00981A%3BQueryDate%3D{year}{month}{day}%3B"
-            f"&FilterNo=0"
-        ),
-    ]
-    h = {**HEADERS}
-    if cookie:
-        h["Cookie"] = cookie
-        h["Referer"] = "https://www.pocket.tw/etf/tw/00981A/fundholding"
 
-    for url in urls:
+def get_suffix(stock_id: str) -> str:
+    otc = {"3691","8299","6274","6223","5274","6446","3661",
+           "4552","3037","3665","3653","3017","3711","3008"}
+    return ".TWO" if stock_id in otc else ".TW"
+
+
+def get_features_for_period(holding_ids: set, period: str) -> pd.DataFrame:
+    """\u53d6得候選池內所有股票特徵（候選池 = 全期入選過的所有股票聯集）"""
+    records = []
+    for tk in CANDIDATE_POOL:
+        suffix = get_suffix(tk)
+        sym    = f"{tk}{suffix}"
         try:
-            r = requests.get(url, headers=h, timeout=15)
-            if r.status_code == 200 and len(r.text) > 50:
-                body = r.text.strip()
-                if body.startswith(("[", "{")):
-                    data = json.loads(body)
-                    rows = data if isinstance(data, list) else data.get("Data", [])
-                    if rows:
-                        print(f"  [upamc/pocket] {query_date} 成功！ {len(rows)} 筆")
-                        return rows
+            t      = yf.Ticker(sym)
+            info   = t.info
+            hist   = t.history(period="9mo")
+            if hist.empty: continue
+            closes = hist["Close"]
+            mom3  = (closes.iloc[-1] / closes.iloc[-63]  - 1) if len(closes) >= 63  else np.nan
+            mom6  = (closes.iloc[-1] / closes.iloc[-126] - 1) if len(closes) >= 126 else np.nan
+            vol60 = closes.pct_change().tail(60).std() * np.sqrt(252)
+            records.append({
+                "stock_id":         tk,
+                "industry":         INDUSTRY_MAP.get(tk, "不明"),
+                "roe":              info.get("returnOnEquity",   np.nan),
+                "pe_ratio":         info.get("trailingPE",       np.nan),
+                "pb_ratio":         info.get("priceToBook",      np.nan),
+                "gross_margin":     info.get("grossMargins",     np.nan),
+                "operating_margin": info.get("operatingMargins", np.nan),
+                "debt_to_equity":   info.get("debtToEquity",     np.nan),
+                "market_cap":       info.get("marketCap",        np.nan),
+                "price_mom_3m":     mom3,
+                "price_mom_6m":     mom6,
+                "volatility_60d":   vol60,
+                "in_etf":           int(tk in holding_ids),
+                "period":           period,
+            })
         except Exception as e:
-            pass
-    return []
+            print(f"    [WARN] {sym}: {e}")
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df["market_cap_rank"] = df["market_cap"].rank(ascending=False)
+    return df
 
 
-# ===========================================================
-# 主流程
-# ===========================================================
 if __name__ == "__main__":
-    cookie = COOKIE_FILE.read_text(encoding="utf-8").strip() if COOKIE_FILE.exists() else ""
+    if not COOKIE_FILE.exists():
+        print("[ERROR] 請先執行: python data/input_cookie.py")
+        exit(1)
+    cookie = COOKIE_FILE.read_text(encoding="utf-8").strip()
 
-    print("=" * 60)
-    print("歷史持股資料查詢")
-    print("=" * 60)
+    # ── Step 1: 下載所有月份持股 ──
+    # 00981A 上市 2025-05-20，從 2025-06 開始查
+    START = date(2025, 6, 1)
+    END   = date.today().replace(day=1)
 
-    # ─ 1. MOPS 公開資訊 ─
-    print("\n[來源 1] MOPS 公開資訊觀測站")
-    # 00981A 上市 2025-05，所以從民國 114 年開始
-    for year_roc, season in [(114, 2), (114, 3), (114, 4), (115, 1)]:
-        rows = fetch_mops_holdings(year_roc, season)
-        if rows:
-            print(f"  MOPS {year_roc}Q{season} 找到 {len(rows)} 筆")
+    raw_records = []
+    period_holdings = {}  # period -> set of stock_id
+
+    cur = START
+    while cur <= END:
+        period   = cur.strftime("%Y-%m")
+        date_str = cur.strftime("%Y%m%d")  # 每月第一天
+        print(f"[{period}] 查詢 {date_str}...", end=" ", flush=True)
+        try:
+            rows = fetch_holdings_by_date(date_str, cookie)
+            if not rows:
+                # 嘗試該月 15 號
+                date_str2 = cur.replace(day=15).strftime("%Y%m%d")
+                rows = fetch_holdings_by_date(date_str2, cookie)
+
+            if rows:
+                ids = {r["stock_id"] for r in rows}
+                print(f"{len(rows)} 支 | 樣本: {sorted(ids)[:5]}...")
+                period_holdings[period] = ids
+                for r in rows:
+                    raw_records.append({"period": period, **r})
+            else:
+                print("無資料")
+        except Exception as e:
+            print(f"[ERR] {e}")
+
+        cur += relativedelta(months=1)
+        time.sleep(0.8)
+
+    # 儲存原始持股
+    raw_df   = pd.DataFrame(raw_records)
+    raw_path = DATA_DIR / "real_holdings_raw.csv"
+    raw_df.to_csv(raw_path, index=False, encoding="utf-8-sig")
+    print(f"\n原始持股已存: {raw_path} ({len(raw_df)} 筆, {raw_df['period'].nunique()} 期)")
+
+    if not period_holdings:
+        print("[ERROR] 沒有取得任何資料")
+        exit(1)
+
+    # 建立候選池 = 所有期入選過的股票
+    global CANDIDATE_POOL
+    CANDIDATE_POOL = set()
+    for ids in period_holdings.values():
+        CANDIDATE_POOL.update(ids)
+    print(f"\n候選池： {len(CANDIDATE_POOL)} 支股票")
+    print(sorted(CANDIDATE_POOL))
+
+    # ── Step 2: 取得 yfinance 特徵 ──
+    print("\n取得 yfinance 特徵（可能需要幾分鐘）...")
+    all_dfs = []
+    for period, holding_ids in sorted(period_holdings.items()):
+        print(f"\n  [{period}] 入選: {sorted(holding_ids)}")
+        df = get_features_for_period(holding_ids, period)
+        if not df.empty:
+            all_dfs.append(df)
         time.sleep(1)
 
-    # ─ 2. Wayback Machine ─
-    print("\n[來源 2] Wayback Machine")
-    snapshots = try_wayback_pocket(cookie)
-
-    # ─ 3. pocket.tw 嘗試指定日期 ─
-    print("\n[來源 3] pocket.tw 帶日期參數")
-    # 每個月第一個持股公布日對應日期
-    test_dates = [
-        "20251001", "20251101", "20251201",
-        "20260101", "20260201",
-    ]
-    for d in test_dates:
-        rows = fetch_upamc_by_date(d, cookie)
-        if rows:
-            print(f"  {d} 找到資料!")
-        else:
-            print(f"  {d} 無資料")
-        time.sleep(0.5)
-
-    print("\n" + "=" * 60)
-    print("結論：")
-    print("• 若 MOPS 有資料 → 每季前10大持股，樣本稍少")
-    print("• 若 Wayback 有 API 快照 → 可以拿到歷史資料")
-    print("• 若全部無效 → 建議每月初手動執行 download_real_holdings.py 累積")
+    if all_dfs:
+        full = pd.concat(all_dfs, ignore_index=True)
+        hist_path = DATA_DIR / "holdings_history.csv"
+        full.to_csv(hist_path, index=False, encoding="utf-8-sig")
+        print(f"\n完成! holdings_history.csv ({len(full)} 筆, {full['period'].nunique()} 期)")
+        print("接下來執行: python backtest/walk_forward.py")
+    else:
+        print("[ERROR] 特徵取得失敗")
