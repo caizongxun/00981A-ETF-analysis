@@ -26,12 +26,29 @@ THRESHOLD    = 0.5
 TRANS_COST   = 0.001425
 TAX_RATE     = 0.003
 
-CANDIDATE_POOL = [
-    "2330", "3691", "4552", "2308", "6669",
-    "2368", "8299", "6274", "2383", "6223",
-    "2454", "3008", "2317", "2382", "3711",
-    "6446", "2357", "2379", "5274", "3661"
-]
+# 候選池：上市用 .TW，上櫃用 .TWO
+CANDIDATE_POOL = {
+    "2330": ".TW",   # 台積電
+    "4552": ".TW",   # 智邦
+    "2308": ".TW",   # 台達電
+    "6669": ".TW",   # 緯穎
+    "2368": ".TW",   # 金像電
+    "2383": ".TW",   # 台光電
+    "2454": ".TW",   # 聯發科
+    "3008": ".TW",   # 大立光
+    "2317": ".TW",   # 鴿海
+    "2382": ".TW",   # 廣達
+    "3711": ".TW",   # 朗潤
+    "2357": ".TW",   # 華硕
+    "3691": ".TWO",  # 奇鋐
+    "8299": ".TWO",  # 群聯
+    "6274": ".TWO",  # 台燿
+    "6223": ".TWO",  # 旺矽
+    "5274": ".TWO",  # 嘉澤科
+    "6446": ".TWO",  # 金議
+    "2379": ".TW",   # 瑞昔
+    "3661": ".TWO",  # 永豊
+}
 
 FEATURE_COLS = [
     "roe", "pe_ratio", "pb_ratio", "gross_margin",
@@ -40,26 +57,18 @@ FEATURE_COLS = [
     "market_cap_rank"
 ]
 
-def get_valid_ticker_obj(stock_id):
-    for suffix in [".TW", ".TWO"]:
-        t = yf.Ticker(f"{stock_id}{suffix}")
-        try:
-            h = t.history(period="5d")
-            if not h.empty:
-                return t
-        except Exception:
-            pass
-    return None
-
-def get_features(tickers):
+# ─ 工具 ────────────────────────────────────────────
+def get_features(pool: dict):
+    """pool = {stock_id: suffix}"""
     records = []
-    for tk in tickers:
-        t = get_valid_ticker_obj(tk)
-        if t is None:
-            continue
+    for tk, suffix in pool.items():
+        sym = f"{tk}{suffix}"
         try:
+            t      = yf.Ticker(sym)
             info   = t.info
             hist   = t.history(period="9mo")
+            if hist.empty:
+                continue
             closes = hist["Close"]
             mom3  = (closes.iloc[-1] / closes.iloc[-63]  - 1) if len(closes) >= 63  else np.nan
             mom6  = (closes.iloc[-1] / closes.iloc[-126] - 1) if len(closes) >= 126 else np.nan
@@ -76,29 +85,48 @@ def get_features(tickers):
                 "price_mom_3m":     mom3,
                 "price_mom_6m":     mom6,
                 "volatility_60d":   vol60,
-                "last_price":       closes.iloc[-1],
+                "last_price":       float(closes.iloc[-1]),
             })
         except Exception as e:
-            print(f"  [WARN] {tk}: {e}")
+            print(f"  [WARN] {sym}: {e}")
     df = pd.DataFrame(records)
     if not df.empty:
         df["market_cap_rank"] = df["market_cap"].rank(ascending=False)
     return df
 
-def download_prices(tickers):
-    price_dict = {}
-    for tk in tickers:
-        for suffix in [".TW", ".TWO"]:
-            try:
-                hist = yf.download(f"{tk}{suffix}", start=START_DATE,
-                                   end=END_DATE, progress=False, auto_adjust=True)
-                if not hist.empty:
-                    price_dict[tk] = hist["Close"]
-                    break
-            except Exception:
-                pass
-    return pd.DataFrame(price_dict).ffill()
 
+def download_prices(pool: dict):
+    """pool = {stock_id: suffix}，回傳 DataFrame(date, ticker)"""
+    price_dict = {}
+    for tk, suffix in pool.items():
+        sym = f"{tk}{suffix}"
+        try:
+            hist = yf.download(sym, start=START_DATE, end=END_DATE,
+                               progress=False, auto_adjust=True)
+            if hist.empty:
+                print(f"  [SKIP] {sym} 無資料")
+                continue
+            # yfinance 新版可能回傳 MultiIndex columns
+            if isinstance(hist.columns, pd.MultiIndex):
+                close = hist["Close"][sym] if sym in hist["Close"].columns else hist["Close"].iloc[:, 0]
+            else:
+                close = hist["Close"]
+            price_dict[tk] = close
+            print(f"  [OK] {sym} {len(close)} 筆")
+        except Exception as e:
+            print(f"  [ERR] {sym}: {e}")
+
+    if not price_dict:
+        raise RuntimeError("所有股票下載失敗，請檢查網路或 CANDIDATE_POOL 代碼")
+
+    df = pd.DataFrame(price_dict)
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    return df.ffill()
+
+
+# ─ 回測引擎 ──────────────────────────────────────────
 class Backtester:
     def __init__(self, model, scaler):
         self.model    = model
@@ -122,7 +150,7 @@ class Backtester:
             p = price_row.get(tk, np.nan)
             if pd.isna(p):
                 continue
-            self.cash += shares * p * (1 - TAX_RATE - TRANS_COST)
+            self.cash += shares * float(p) * (1 - TAX_RATE - TRANS_COST)
             self.trade_log.append((date, "SELL", tk, shares, round(float(p), 2)))
         self.holdings = {}
 
@@ -148,7 +176,7 @@ class Backtester:
         self.nav_history.append({"date": date, "nav": nav})
         return nav
 
-    def run(self, price_df):
+    def run(self, price_df, pool):
         rebalance_dates = pd.date_range(START_DATE, END_DATE, freq="MS")
         print(f"回測期間: {START_DATE} ~ {END_DATE}")
         for rb_date in rebalance_dates:
@@ -159,14 +187,16 @@ class Backtester:
             price_row = price_df.loc[avail[-1]].to_dict()
             self._sell_all(price_row, date_str)
             print(f"[{date_str}] 取得特徵中...", end=" ", flush=True)
-            feat_df     = get_features(CANDIDATE_POOL)
+            feat_df     = get_features(pool)
             top_tickers = self._predict_top_n(feat_df)
             print(f"入選: {top_tickers}")
             self._buy_equal(top_tickers, price_row, date_str)
             nav = self.calc_nav(price_row, date_str)
-            print(f"  NAV: {nav:,.0f} 元  現金: {self.cash:,.0f} 元")
+            print(f"  NAV: {nav:,.0f} 元")
         return pd.DataFrame(self.nav_history).set_index("date")
 
+
+# ─ 績效 + 畫圖 ─────────────────────────────────────────
 def calc_performance(nav_df):
     ret    = nav_df["nav"].pct_change().dropna()
     total  = nav_df["nav"].iloc[-1] / nav_df["nav"].iloc[0] - 1
@@ -189,13 +219,12 @@ def calc_performance(nav_df):
 
 def plot_nav(nav_df):
     nav_norm = nav_df["nav"] / nav_df["nav"].iloc[0] * 100
-    fig, ax  = plt.subplots(figsize=(12, 5))
-    ax.plot(nav_norm.index, nav_norm.values, label="策略 NAV", linewidth=2, color="steelblue")
+    vals = nav_norm.values.astype(float)
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(nav_norm.index, vals, label="策略 NAV", linewidth=2, color="steelblue")
     ax.axhline(100, color="gray", linestyle="--", alpha=0.5, label="起始基準")
-    ax.fill_between(nav_norm.index, 100, nav_norm.values,
-                    where=(nav_norm.values >= 100), alpha=0.15, color="green")
-    ax.fill_between(nav_norm.index, 100, nav_norm.values,
-                    where=(nav_norm.values < 100),  alpha=0.15, color="red")
+    ax.fill_between(nav_norm.index, 100, vals, where=(vals >= 100), alpha=0.15, color="green")
+    ax.fill_between(nav_norm.index, 100, vals, where=(vals <  100), alpha=0.15, color="red")
     ax.set_title("00981A 選股策略 回測 NAV")
     ax.set_ylabel("累積淨值 (起始=100)")
     ax.legend()
@@ -204,6 +233,8 @@ def plot_nav(nav_df):
     plt.savefig(out, dpi=150)
     print(f"NAV 圖已存: {out}")
 
+
+# ─ 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
     model_path  = DATA_DIR / "rf_model.pkl"
     scaler_path = DATA_DIR / "scaler.pkl"
@@ -212,13 +243,17 @@ if __name__ == "__main__":
         exit(1)
     with open(model_path,  "rb") as f: model  = pickle.load(f)
     with open(scaler_path, "rb") as f: scaler = pickle.load(f)
+
     print("下載候選股歷史股價...")
     price_df = download_prices(CANDIDATE_POOL)
     print(f"取得 {len(price_df.columns)} 支股票的歷史股價")
+
     bt     = Backtester(model, scaler)
-    nav_df = bt.run(price_df)
+    nav_df = bt.run(price_df, CANDIDATE_POOL)
+
     calc_performance(nav_df)
     plot_nav(nav_df)
+
     trade_df = pd.DataFrame(bt.trade_log,
                             columns=["date", "action", "ticker", "shares", "price"])
     out = DATA_DIR / "trade_log.csv"
