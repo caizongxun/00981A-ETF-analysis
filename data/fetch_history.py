@@ -34,43 +34,29 @@ HEADERS_BASE = {
     "Referer": "https://www.pocket.tw/etf/tw/00981A/fundholding",
 }
 
-# ── 自動判斷上市/上櫃 ──
+# ── 直接嘗試 .TW 和 .TWO，找到有股價的那個 ──
 _SUFFIX_CACHE: dict[str, str] = {}
 
-def get_suffix(stock_id: str) -> str:
-    """\u67e5 TWSE API 確認是上市(.TW)還是上櫃(.TWO)"""
+def get_valid_symbol(stock_id: str) -> tuple[str, str] | None:
+    """
+    回傳 (symbol, suffix) 或 None
+    """
     if stock_id in _SUFFIX_CACHE:
-        return _SUFFIX_CACHE[stock_id]
+        s = _SUFFIX_CACHE[stock_id]
+        return (f"{stock_id}{s}", s)
 
-    # 先試 .TW
-    try:
-        r = requests.get(
-            f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{stock_id}.tw",
-            timeout=5
-        )
-        data = r.json()
-        if data.get("msgArray"):
-            _SUFFIX_CACHE[stock_id] = ".TW"
-            return ".TW"
-    except:
-        pass
-
-    # 嘗試 .TWO
-    try:
-        r = requests.get(
-            f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=otc_{stock_id}.tw",
-            timeout=5
-        )
-        data = r.json()
-        if data.get("msgArray"):
-            _SUFFIX_CACHE[stock_id] = ".TWO"
-            return ".TWO"
-    except:
-        pass
-
-    # 預設用 .TW
-    _SUFFIX_CACHE[stock_id] = ".TW"
-    return ".TW"
+    for suffix in (".TW", ".TWO"):
+        sym = f"{stock_id}{suffix}"
+        try:
+            hist = yf.Ticker(sym).history(period="5d")
+            if not hist.empty:
+                _SUFFIX_CACHE[stock_id] = suffix
+                return (sym, suffix)
+        except:
+            pass
+    # 兩個都失敗
+    _SUFFIX_CACHE[stock_id] = None
+    return None
 
 
 def fetch_holdings_by_date(query_date: str, cookie: str) -> list[dict]:
@@ -104,17 +90,20 @@ def fetch_holdings_by_date(query_date: str, cookie: str) -> list[dict]:
 
 def get_features_for_period(candidate_pool: set, holding_ids: set, period: str) -> pd.DataFrame:
     records = []
-    total = len(candidate_pool)
+    total   = len(candidate_pool)
     for i, tk in enumerate(sorted(candidate_pool), 1):
-        suffix = get_suffix(tk)
-        sym    = f"{tk}{suffix}"
+        result = get_valid_symbol(tk)
+        if result is None:
+            print(f"    [{i}/{total}] {tk} [SKIP] 兩個後綴都無股價")
+            continue
+        sym, suffix = result
         print(f"    [{i}/{total}] {sym}", end=" ", flush=True)
         try:
             t      = yf.Ticker(sym)
             info   = t.info
             hist   = t.history(period="9mo")
             if hist.empty:
-                print("[SKIP]無股價")
+                print("[SKIP]")
                 continue
             closes = hist["Close"]
             mom3  = (closes.iloc[-1] / closes.iloc[-63]  - 1) if len(closes) >= 63  else np.nan
@@ -156,26 +145,24 @@ if __name__ == "__main__":
     END   = date.today().replace(day=1)
 
     raw_records     = []
-    period_holdings = {}  # period -> set of stock_id
+    period_holdings = {}
 
     cur = START
     while cur <= END:
         period   = cur.strftime("%Y-%m")
         date_str = cur.strftime("%Y%m%d")
-        print(f"[{period}] 查詢 {date_str}...", end=" ", flush=True)
+        print(f"[{period}] 查詢...", end=" ", flush=True)
         try:
             rows = fetch_holdings_by_date(date_str, cookie)
             if not rows:
-                date_str2 = cur.replace(day=15).strftime("%Y%m%d")
-                rows = fetch_holdings_by_date(date_str2, cookie)
+                rows = fetch_holdings_by_date(cur.replace(day=15).strftime("%Y%m%d"), cookie)
             if rows:
-                ids = {r["stock_id"] for r in rows}
-                # 不要原料制品（1303沖化、1326台化等）
-                ids = {sid for sid in ids if not sid.startswith(("1","2002","2059"))}
-                # 只保留電子相關股票（上市代號 2xxx 3xxx 4xxx 5xxx 6xxx 8xxx）
-                ids = {sid for sid in ids
-                       if re.match(r'^[2-9]\d{3}$', sid) or re.match(r'^[2-9]\d{4}$', sid)}
-                print(f"{len(ids)} 支電子股")
+                # 只保留電子/科技相關股（2xxx~8xxx）
+                ids = {
+                    r["stock_id"] for r in rows
+                    if re.match(r'^[2-9]\d{3}$', r["stock_id"])
+                }
+                print(f"{len(ids)} 支")
                 period_holdings[period] = ids
                 for r in rows:
                     if r["stock_id"] in ids:
@@ -185,9 +172,8 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[ERR] {e}")
         cur += relativedelta(months=1)
-        time.sleep(0.8)
+        time.sleep(0.5)
 
-    # 儲存原始持股
     raw_df = pd.DataFrame(raw_records)
     raw_path = DATA_DIR / "real_holdings_raw.csv"
     raw_df.to_csv(raw_path, index=False, encoding="utf-8-sig")
@@ -197,26 +183,34 @@ if __name__ == "__main__":
         print("[ERROR] 沒有資料")
         exit(1)
 
-    # 候選池 = 所有期出現過的股票聯集
+    # 候選池 = 所有期出現過
     candidate_pool = set()
     for ids in period_holdings.values():
         candidate_pool.update(ids)
     print(f"\n候選池: {len(candidate_pool)} 支")
-    print(f"  {sorted(candidate_pool)}")
 
-    # 預先建立 suffix cache，內後再一次查詢
-    print("\n建立上市/上櫃判斷 cache...(TWSE API)")
+    # 預先建立 suffix cache（會自動嘗試 .TW 再試 .TWO）
+    print("\n確認候選池股票後綴...(TW/TWO)")
+    valid_pool = set()
     for tk in sorted(candidate_pool):
-        s = get_suffix(tk)
-        print(f"  {tk} -> {s}")
-        time.sleep(0.2)
+        result = get_valid_symbol(tk)
+        if result:
+            print(f"  {tk} -> {result[0]} [OK]")
+            valid_pool.add(tk)
+        else:
+            print(f"  {tk} -> [SKIP] Yahoo 無資料")
+        time.sleep(0.3)
 
-    # ── Step 2: 取得特徵 ──
+    print(f"\n有效候選池: {len(valid_pool)} 支 ({len(candidate_pool)-len(valid_pool)} 支無股價已移除)")
+
+    # ── Step 2: 特徵 ──
     print("\n取得 yfinance 特徵...")
     all_dfs = []
     for period, holding_ids in sorted(period_holdings.items()):
-        print(f"\n  [{period}] 入選 {len(holding_ids)} 支: {sorted(holding_ids)}")
-        df = get_features_for_period(candidate_pool, holding_ids, period)
+        # 將 holding_ids 也過濾為 valid_pool 內的
+        valid_holding = holding_ids & valid_pool
+        print(f"\n  [{period}] 入選 {len(valid_holding)} 支: {sorted(valid_holding)}")
+        df = get_features_for_period(valid_pool, valid_holding, period)
         if not df.empty:
             all_dfs.append(df)
         time.sleep(1)
