@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets
+.cookie
+.finmind_token
+.finmind_tokens
+*.token
+
+# Data (large files)
+data/*.csv
+data/*.json
+
+# IDE
+.idea/
+.vscode/
+*.iml
