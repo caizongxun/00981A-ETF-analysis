@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-日頻模型回測系統 - Walk-Forward Out-of-Sample v7
+日頻模型回測系統 - Walk-Forward Out-of-Sample v8
 
-新增功能:
-  - SLIPPAGE_RT: 滑價模擬 (預設 0.3%, 包括買賣兩邊)
-  - LIQUIDITY_FAIL_PROB: 漲尼風險 (預設 5% 機率無法成交, 改持到下一期)
+優化:
+  - MIN_SCORE: 最低 score 門檻，過濾低信心選股
+  - ATR 動態停損: 停損 = -ATR_MULT * atr_pct (取代固定 -3%)
+  - SLIPPAGE_RT: 滑價模擬
+  - LIQUIDITY_FAIL: 流動性失敗模擬
   - INIT_CAPITAL: 起始資金 10,000 NTD
-  - 輸出每月資金淳値與報酬
 
 執行: python daily/backtest.py
 """
@@ -31,13 +32,14 @@ OUT_EQUITY = DATA_DIR / "backtest_equity.csv"
 N_FOLDS          = 6
 MIN_TRAIN_MONTHS = 12
 TOP_N            = 5
-STOP_LOSS        = -0.03
-UP_CAP           =  0.097
-COST_RT          = 0.001425   # 券商手續費單邊
-SLIPPAGE_RT      = 0.003      # 滑價假設：買賣共 0.3%
-LIQUIDITY_FAIL   = 0.05       # 5% 機率該筆無法成交 (漲尼模擬)
-HOLD_DAYS        = 3          # 1=隨即出場, 3=續抜3天, 5=續抜5天
-INIT_CAPITAL     = 10_000     # 起始資金 (NTD)
+ATR_MULT         = 1.5     # 動態停損: -ATR_MULT * atr_pct，替代固定 STOP_LOSS
+UP_CAP           = 0.097
+COST_RT          = 0.001425
+SLIPPAGE_RT      = 0.003
+LIQUIDITY_FAIL   = 0.05
+HOLD_DAYS        = 3
+INIT_CAPITAL     = 10_000
+MIN_SCORE        = 0.10    # score < 0.1 不選
 RANDOM_SEED      = 42
 
 
@@ -76,7 +78,7 @@ def train_fold(X_tr, y_up, y_dn):
         pos_rate  = y.mean()
         scale_pos = (1 - pos_rate) / pos_rate if pos_rate > 0 else 1.0
         m = lgb.LGBMClassifier(
-            n_estimators=500, learning_rate=0.03,
+            n_estimators=600, learning_rate=0.025,
             num_leaves=31, max_depth=5,
             min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
             scale_pos_weight=scale_pos, class_weight="balanced",
@@ -89,13 +91,14 @@ def train_fold(X_tr, y_up, y_dn):
 
 
 def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
-    n_trades  = len(trades_df)
-    win_rate  = (trades_df["adj_ret"] > 0).mean() * 100
-    avg_ret   = trades_df["adj_ret"].mean() * 100
-    total_ret = equity_df["cum_ret"].iloc[-1] * 100
-    bm_ret_t  = equity_df["bm_cum_ret"].iloc[-1] * 100
-    excess    = total_ret - bm_ret_t
+    n_trades   = len(trades_df)
+    win_rate   = (trades_df["adj_ret"] > 0).mean() * 100
+    avg_ret    = trades_df["adj_ret"].mean() * 100
+    total_ret  = equity_df["cum_ret"].iloc[-1] * 100
+    bm_ret_t   = equity_df["bm_cum_ret"].iloc[-1] * 100
+    excess     = total_ret - bm_ret_t
     liq_fail_n = trades_df["liq_failed"].sum()
+    stopped_n  = trades_df["stopped"].sum()
 
     eq       = equity_df["cum_ret"].values + 1
     roll_max = np.maximum.accumulate(eq)
@@ -113,16 +116,15 @@ def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
     sharpe  = float(np.mean(eq_rets) / np.std(eq_rets) * np.sqrt(252)) \
               if np.std(eq_rets) > 0 else 0.0
 
-    # 資金曲線
     final_capital = equity_df["capital"].iloc[-1]
 
     print("\n" + "="*60)
     print("Walk-Forward OOS 回測結果  (基準: 0050)")
     print(f"回測期間: {pd.Timestamp(bt_s).date()} ~ {pd.Timestamp(bt_e).date()}  "
           f"({n_calendar_days}日/{n_years:.2f}年)  Folds: {n_folds}")
-    print(f"選股數: top {top_n}  持有: {hold_days}天")
-    print(f"交易成本: 券商 {COST_RT*100:.4f}% + 滑價 {SLIPPAGE_RT*100:.2f}% (單邊)共 {(COST_RT+SLIPPAGE_RT)*100:.4f}%")
-    print(f"漲尼機率: {LIQUIDITY_FAIL*100:.0f}%  (共發生 {liq_fail_n} 筆)")
+    print(f"選股數: top {top_n}  持有: {hold_days}天  MIN_SCORE: {MIN_SCORE}")
+    print(f"停損: ATR x{ATR_MULT}  交易成本: {(COST_RT+SLIPPAGE_RT)*100:.4f}%/邊")
+    print(f"流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  (共 {liq_fail_n} 筆)  ATR停損觸發: {stopped_n} 筆")
     print("="*60)
     print(f"起始資金      : {INIT_CAPITAL:,.0f} NTD")
     print(f"最終資金      : {final_capital:,.0f} NTD")
@@ -138,7 +140,6 @@ def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
     print(f"年化 Sharpe   : {sharpe:.3f}")
     print("="*60)
 
-    # 月分資金表
     eq2 = equity_df.copy()
     eq2["month"] = pd.to_datetime(eq2["date"]).dt.to_period("M")
     monthly = eq2.groupby("month").agg(
@@ -169,7 +170,8 @@ def run_backtest():
         print("[ERROR] 請先執行 python daily/build_features.py")
         sys.exit(1)
 
-    df["fwd_ret_1d"] = df["fwd_ret_1d"].clip(STOP_LOSS, UP_CAP)
+    # 動態停損: 用 atr_pct_raw 計算每筆的停損下限 (不預先 clip)
+    has_atr_raw = "atr_pct_raw" in df.columns
 
     avail = [c for c in feat_cols if c in df.columns]
     has_down = "label_down1" in df.columns
@@ -179,8 +181,8 @@ def run_backtest():
     total_days = len(all_dates)
     date_idx   = {d: i for i, d in enumerate(all_dates)}
     print(f"資料範圍: {all_dates[0].date()} ~ {all_dates[-1].date()} ({total_days} 交易日)")
-    print(f"持有天數: {HOLD_DAYS} 天  滑價: {SLIPPAGE_RT*100:.2f}%  漲尼機率: {LIQUIDITY_FAIL*100:.0f}%")
-    print(f"起始資金: {INIT_CAPITAL:,} NTD")
+    print(f"持有天數: {HOLD_DAYS}天  MIN_SCORE: {MIN_SCORE}  ATR停損倍數: x{ATR_MULT}")
+    print(f"滑價: {SLIPPAGE_RT*100:.2f}%  流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  起始資金: {INIT_CAPITAL:,} NTD")
 
     min_train_days = MIN_TRAIN_MONTHS * 21
     bt_dates  = all_dates[min_train_days:]
@@ -203,12 +205,10 @@ def run_backtest():
 
     all_trades  = []
     all_eq_rows = []
-    cum_ret  = 0.0
-    bm_cum   = 0.0
-    capital  = float(INIT_CAPITAL)
-
-    # 漲尼演算：如果上期有筆漲尼，下一期對应股票繼續持有
-    carry_over = {}  # stock_id -> remaining_raw_ret (carry hold 1 more period)
+    cum_ret = 0.0
+    bm_cum  = 0.0
+    capital = float(INIT_CAPITAL)
+    carry_over = {}
 
     for fold_i, (fold_start, fold_end) in enumerate(folds):
         print(f"\n[Fold {fold_i+1}/{N_FOLDS}] 訓練中...", end=" ", flush=True)
@@ -229,7 +229,7 @@ def run_backtest():
         for sig_i in signal_indices:
             dt = test_dates[sig_i]
             day_df = test_df[test_df["date"] == dt].dropna(subset=avail).copy()
-            if len(day_df) < TOP_N:
+            if len(day_df) < 1:
                 continue
 
             X_day = pd.DataFrame(day_df[avail].values.astype(np.float32), columns=avail)
@@ -237,62 +237,86 @@ def run_backtest():
             day_df["dn_prob"] = dn_model.predict_proba(X_day)[:, 1]
             day_df["score"]   = day_df["up_prob"] - day_df["dn_prob"]
 
-            candidates = day_df[day_df["score"] > 0]
-            if len(candidates) < TOP_N:
+            # MIN_SCORE 過濾 + score > 0
+            candidates = day_df[(day_df["score"] >= MIN_SCORE)]
+            if len(candidates) == 0:
+                candidates = day_df[day_df["score"] > 0]
+            if len(candidates) == 0:
                 candidates = day_df
-            picks = candidates.nlargest(TOP_N, "up_prob")
+
+            picks = candidates.nlargest(min(TOP_N, len(candidates)), "up_prob")
 
             raw_rets  = []
             liq_flags = []
+            stop_flags = []
 
             for _, row in picks.iterrows():
                 sid = row["stock_id"]
 
-                # 漲尼機率檢查: 買入時無法成交
+                # 動態停損門檻
+                atr_val = float(row["atr_pct_raw"]) if has_atr_raw and not pd.isna(row.get("atr_pct_raw", np.nan)) else 0.03
+                dyn_stop = -ATR_MULT * max(atr_val, 0.005)  # 最低 -0.5% * 1.5 = -0.75%
+
                 if rng.random() < LIQUIDITY_FAIL:
-                    # 拿上一期的保留報酬 (如果有), 否則 0
                     fallback = carry_over.pop(sid, 0.0)
                     raw_rets.append(fallback)
                     liq_flags.append(1)
+                    stop_flags.append(0)
                     continue
 
                 si = date_idx.get(dt)
                 if si is None:
-                    raw_rets.append(np.nan); liq_flags.append(0); continue
+                    raw_rets.append(np.nan); liq_flags.append(0); stop_flags.append(0); continue
 
                 exit_i  = min(si + HOLD_DAYS, len(all_dates) - 1)
                 hold_df = df[(df["stock_id"] == sid) &
                              (df["date"] >  dt) &
                              (df["date"] <= all_dates[exit_i])]
+
                 if hold_df.empty:
-                    raw_rets.append(float(row["fwd_ret_1d"])); liq_flags.append(0); continue
+                    r = float(row["fwd_ret_1d"])
+                    cum = max(r, dyn_stop * HOLD_DAYS)
+                    raw_rets.append(cum); liq_flags.append(0)
+                    stop_flags.append(int(r < dyn_stop * HOLD_DAYS))
+                    continue
 
-                cum = float((1 + hold_df["fwd_ret_1d"]).prod() - 1)
+                # 逐日模擬：觸及 ATR 停損即出場
+                cum = 0.0
+                stopped = False
+                for _, day_r in hold_df.iterrows():
+                    daily_r = float(day_r["fwd_ret_1d"])
+                    cum = (1 + cum) * (1 + daily_r) - 1
+                    if cum <= dyn_stop:
+                        stopped = True
+                        cum = dyn_stop
+                        break
+                cum = min(cum, UP_CAP * HOLD_DAYS)
 
-                # 漲尼機率檢查: 賣出時無法成交，延伸持有一期
                 if rng.random() < LIQUIDITY_FAIL:
-                    carry_over[sid] = cum   # 下期再算報酬
-                    raw_rets.append(0.0)    # 本期報酬計 0
+                    carry_over[sid] = cum
+                    raw_rets.append(0.0)
                     liq_flags.append(1)
+                    stop_flags.append(int(stopped))
                 else:
                     carry_over.pop(sid, None)
                     raw_rets.append(cum)
                     liq_flags.append(0)
+                    stop_flags.append(int(stopped))
 
-            raw_rets  = np.array(raw_rets,  dtype=float)
-            liq_flags = np.array(liq_flags, dtype=int)
-            valid     = ~np.isnan(raw_rets)
+            raw_rets   = np.array(raw_rets,   dtype=float)
+            liq_flags  = np.array(liq_flags,  dtype=int)
+            stop_flags = np.array(stop_flags, dtype=int)
+            valid      = ~np.isnan(raw_rets)
             if valid.sum() == 0: continue
 
-            raw_rets_v = raw_rets[valid]
-            liq_v      = liq_flags[valid]
+            raw_rets_v  = raw_rets[valid]
+            liq_v       = liq_flags[valid]
+            stop_v      = stop_flags[valid]
 
-            # 成本 = 券商 + 滑價 (只對漗順成交的筆數扣成本)
             cost_per_trade = (COST_RT + SLIPPAGE_RT) * 2
             adj_rets = raw_rets_v - np.where(liq_v == 0, cost_per_trade, 0.0)
             port_ret = float(np.mean(adj_rets))
 
-            # 資金更新
             capital = capital * (1 + port_ret)
 
             si     = date_idx.get(dt)
@@ -332,8 +356,7 @@ def run_backtest():
                     "raw_ret":     round(r,     6),
                     "adj_ret":     round(r_adj, 6),
                     "liq_failed":  int(liq_v[k]),
-                    "stopped":     int(r <= STOP_LOSS * HOLD_DAYS),
-                    "capped":      int(r >= UP_CAP    * HOLD_DAYS),
+                    "stopped":     int(stop_v[k]),
                 })
 
     trades_df = pd.DataFrame(all_trades)
