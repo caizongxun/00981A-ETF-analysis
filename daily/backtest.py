@@ -4,23 +4,20 @@
 
 架構:
   1. 將全部資料按時間切成 N 個 fold
-  2. 每個 fold:
-       train = fold 開始之前所有資料 (对当前 fold 而言是未來)
-       test  = 此 fold 期間 (模型完全沒見過)
-  3. 拼接每個 fold 的預測結果得到完整 OOS 回測曲線
+  2. 每個 fold: train = fold 開始之前所有資料, test = 此 fold 期間
+  3. 拼接每個 fold 的預測得到完整 OOS 曲線
 
 策略:
   - 每日收盤後用 T 特徵預測 T+1 報酬
   - 選 up_prob 前 5 名買入，權重等重
   - T+1 收盤出場 (保持 1 天)
-  - 停損: 實際報酬 < -3% 則按 -3% 計算
+  - 單日報酬上限 +9.7% (漲停庄上限)、下限 -3% (停損)
   - 基準: 每日持有宇宙全部股票均等權重
 
 執行: python daily/backtest.py
 """
 import sys
 import json
-import pickle
 from pathlib import Path
 
 import pandas as pd
@@ -36,11 +33,12 @@ OUT_TRADES = DATA_DIR / "backtest_trades.csv"
 OUT_EQUITY = DATA_DIR / "backtest_equity.csv"
 
 # 回測參數
-N_FOLDS       = 6      # walk-forward fold 數 (= 回測山月數)
-MIN_TRAIN_MONTHS = 12  # 每個 fold 至少需要 12 個月訓練資料
-TOP_N         = 5
-STOP_LOSS     = -0.03
-COST_RT       = 0.001425
+N_FOLDS          = 6
+MIN_TRAIN_MONTHS = 12
+TOP_N            = 5
+STOP_LOSS        = -0.03    # 單日下限
+UP_CAP           =  0.097   # 單日上限 (台股漲停庄 +9.7%)
+COST_RT          = 0.001425 # 單邊成本
 
 FEATURE_COLS = [
     "vol_ratio_5d", "vol_ratio_20d", "vol_zscore_20d",
@@ -58,8 +56,7 @@ def load_feat_cols():
     return meta["feature_cols"] if isinstance(meta, dict) else meta
 
 
-def train_fold(X_tr: pd.DataFrame, y_tr: np.ndarray) -> object:
-    """train LightGBM on given fold data"""
+def train_fold(X_tr: pd.DataFrame, y_tr: np.ndarray):
     try:
         import lightgbm as lgb
     except ImportError:
@@ -85,6 +82,63 @@ def train_fold(X_tr: pd.DataFrame, y_tr: np.ndarray) -> object:
     return model
 
 
+def summarize(trades_df: pd.DataFrame, equity_df: pd.DataFrame,
+              n_folds: int, top_n: int):
+    n_trades  = len(trades_df)
+    win_rate  = (trades_df["adj_ret"] > 0).mean() * 100
+    avg_ret   = trades_df["adj_ret"].mean() * 100
+    total_ret = equity_df["cum_ret"].iloc[-1] * 100
+    bm_ret_t  = equity_df["bm_cum_ret"].iloc[-1] * 100
+    excess    = total_ret - bm_ret_t
+    stop_n    = trades_df["stopped"].sum()
+    capped_n  = trades_df["capped"].sum()
+
+    eq       = equity_df["cum_ret"].values + 1
+    roll_max = np.maximum.accumulate(eq)
+    max_dd   = float(((eq - roll_max) / roll_max).min()) * 100
+
+    daily = equity_df["port_ret"].values
+    sharpe = float(np.mean(daily) / np.std(daily) * np.sqrt(252)) \
+             if np.std(daily) > 0 else 0.0
+
+    # 年化報酬 (從總報酬推算)
+    n_days    = len(equity_df)
+    ann_ret   = float((1 + total_ret / 100) ** (252 / n_days) - 1) * 100
+    bm_ann    = float((1 + bm_ret_t  / 100) ** (252 / n_days) - 1) * 100
+
+    bt_s = equity_df["date"].min().date()
+    bt_e = equity_df["date"].max().date()
+
+    print("\n" + "="*55)
+    print("Walk-Forward OOS 回測結果")
+    print(f"回測期間: {bt_s} ~ {bt_e}  Folds: {n_folds}")
+    print(f"選股數: top {top_n}  停損: {STOP_LOSS*100:.0f}%  上限: {UP_CAP*100:.1f}%  每邊成本: {COST_RT*100:.4f}%")
+    print("="*55)
+    print(f"總交易筆數    : {n_trades}")
+    print(f"勝率         : {win_rate:.1f}%")
+    print(f"平均單筆報酬  : {avg_ret:+.3f}%")
+    print(f"單日停損筆數  : {stop_n}  ({stop_n/n_trades*100:.1f}%)")
+    print(f"單日觸上限筆數: {capped_n}  ({capped_n/n_trades*100:.1f}%)")
+    print(f"策略總報酬    : {total_ret:+.2f}%")
+    print(f"策略年化報酬  : {ann_ret:+.2f}%")
+    print(f"基準總報酬    : {bm_ret_t:+.2f}%")
+    print(f"基準年化報酬  : {bm_ann:+.2f}%")
+    print(f"超額報酬      : {excess:+.2f}%")
+    print(f"最大回撤      : {max_dd:.2f}%")
+    print(f"年化 Sharpe   : {sharpe:.3f}")
+    print("="*55)
+
+    equity_df2 = equity_df.copy()
+    equity_df2["month"] = pd.to_datetime(equity_df2["date"]).dt.to_period("M")
+    monthly = equity_df2.groupby("month").agg(
+        port=pd.NamedAgg("port_ret", lambda x: (1 + x).prod() - 1),
+        bm=pd.NamedAgg("bm_ret",   lambda x: (1 + x).prod() - 1),
+    )
+    monthly["excess"] = monthly["port"] - monthly["bm"]
+    print("\n月分装報酬 (%):")
+    print((monthly * 100).round(2).to_string())
+
+
 def run_backtest():
     feat_cols = load_feat_cols()
 
@@ -97,34 +151,36 @@ def run_backtest():
         print("[ERROR] 請先執行 python daily/build_features.py")
         sys.exit(1)
 
+    # 報酬上下限 cap，防止漲停庄/跌停庄等異常値歪曲結果
+    df["fwd_ret_1d"] = df["fwd_ret_1d"].clip(STOP_LOSS, UP_CAP)
+
     avail = [c for c in feat_cols if c in df.columns]
     df.dropna(subset=avail + ["label_up1", "fwd_ret_1d"], inplace=True)
 
-    all_dates = sorted(df["date"].unique())
+    all_dates  = sorted(df["date"].unique())
     total_days = len(all_dates)
     print(f"資料範圍: {all_dates[0].date()} ~ {all_dates[-1].date()} ({total_days} 交易日)")
 
-    # 建構 fold 邊界: 將後 6 個月的交易日分成 N_FOLDS 個等長區間
+    # 建構 fold 邊界
     min_train_days = MIN_TRAIN_MONTHS * 21
     if total_days <= min_train_days + N_FOLDS:
-        print(f"[ERROR] 資料太少，至少需要 {min_train_days + N_FOLDS + 1} 天資料")
+        print(f"[ERROR] 資料太少")
         sys.exit(1)
 
-    bt_dates  = all_dates[min_train_days:]   # 可用于回測的日期
+    bt_dates  = all_dates[min_train_days:]
     fold_size = len(bt_dates) // N_FOLDS
     folds = []
     for i in range(N_FOLDS):
-        start_idx = i * fold_size
-        end_idx   = (i + 1) * fold_size if i < N_FOLDS - 1 else len(bt_dates)
-        folds.append((bt_dates[start_idx], bt_dates[end_idx - 1]))
+        s = i * fold_size
+        e = (i + 1) * fold_size if i < N_FOLDS - 1 else len(bt_dates)
+        folds.append((bt_dates[s], bt_dates[e - 1]))
 
     print(f"\nWalk-Forward Folds ({N_FOLDS} 個):")
     for i, (s, e) in enumerate(folds):
         train_end = all_dates[all_dates.index(s) - 1]
-        n_train   = len([d for d in all_dates if d <= train_end])
-        print(f"  Fold {i+1}: train=~{train_end.date()} ({n_train}天)  test={s.date()}~{e.date()}")
+        n_tr = len([d for d in all_dates if d <= train_end])
+        print(f"  Fold {i+1}: train=~{train_end.date()} ({n_tr}天)  test={s.date()}~{e.date()}")
 
-    # 逐 fold 訓練 + 預測
     all_trades  = []
     all_eq_rows = []
     cum_ret = 0.0
@@ -133,20 +189,14 @@ def run_backtest():
     for fold_i, (fold_start, fold_end) in enumerate(folds):
         print(f"\n[Fold {fold_i+1}/{N_FOLDS}] 訓練中...", end=" ", flush=True)
 
-        train_mask = df["date"] < fold_start
-        test_mask  = (df["date"] >= fold_start) & (df["date"] <= fold_end)
-
-        train_df = df[train_mask]
-        test_df  = df[test_mask]
+        train_df = df[df["date"] < fold_start]
+        test_df  = df[(df["date"] >= fold_start) & (df["date"] <= fold_end)]
 
         X_tr = pd.DataFrame(train_df[avail].values.astype(np.float32), columns=avail)
-        y_tr = train_df["label_up1"].values
-
-        model = train_fold(X_tr, y_tr)
+        model = train_fold(X_tr, train_df["label_up1"].values)
         print(f"完成  (訓練 {len(X_tr):,} 筆 | 測試 {len(test_df):,} 筆)")
 
-        fold_dates = sorted(test_df["date"].unique())
-        for dt in fold_dates:
+        for dt in sorted(test_df["date"].unique()):
             day_df = test_df[test_df["date"] == dt].dropna(subset=avail)
             if len(day_df) < TOP_N:
                 continue
@@ -155,14 +205,13 @@ def run_backtest():
             day_df = day_df.copy()
             day_df["up_prob"] = model.predict_proba(X_day)[:, 1]
 
-            picks = day_df.nlargest(TOP_N, "up_prob")
-            rets  = picks["fwd_ret_1d"].values
-            rets  = np.clip(rets, STOP_LOSS, None)
-            rets  = rets - COST_RT * 2
-            port_ret = float(np.mean(rets))
+            picks    = day_df.nlargest(TOP_N, "up_prob")
+            raw_rets = picks["fwd_ret_1d"].values          # 已經 cap 過
+            adj_rets = raw_rets - COST_RT * 2
+            port_ret = float(np.mean(adj_rets))
 
-            univ_rets = test_df[test_df["date"] == dt]["fwd_ret_1d"].dropna()
-            bm_ret    = float(univ_rets.mean()) if len(univ_rets) > 0 else 0.0
+            univ_ret = float(test_df[test_df["date"] == dt]["fwd_ret_1d"].mean())
+            bm_ret   = univ_ret if not np.isnan(univ_ret) else 0.0
 
             cum_ret += np.log1p(port_ret)
             bm_cum  += np.log1p(bm_ret)
@@ -177,8 +226,8 @@ def run_backtest():
             })
 
             for _, row in picks.iterrows():
-                r = float(row["fwd_ret_1d"])
-                r_adj = max(r, STOP_LOSS) - COST_RT * 2
+                r     = float(row["fwd_ret_1d"])
+                r_adj = r - COST_RT * 2
                 all_trades.append({
                     "fold":        fold_i + 1,
                     "signal_date": dt,
@@ -187,7 +236,8 @@ def run_backtest():
                     "entry_close": round(float(row["close"]),  2),
                     "raw_ret":     round(r,     6),
                     "adj_ret":     round(r_adj, 6),
-                    "stopped":     int(r < STOP_LOSS),
+                    "stopped":     int(r <= STOP_LOSS),
+                    "capped":      int(r >= UP_CAP),
                 })
 
     trades_df = pd.DataFrame(all_trades)
@@ -196,51 +246,7 @@ def run_backtest():
     trades_df.to_csv(OUT_TRADES, index=False, encoding="utf-8-sig")
     equity_df.to_csv(OUT_EQUITY, index=False, encoding="utf-8-sig")
 
-    # 結果展示
-    n_trades  = len(trades_df)
-    win_rate  = (trades_df["adj_ret"] > 0).mean() * 100
-    avg_ret   = trades_df["adj_ret"].mean() * 100
-    total_ret = equity_df["cum_ret"].iloc[-1] * 100
-    bm_ret_t  = equity_df["bm_cum_ret"].iloc[-1] * 100
-    excess    = total_ret - bm_ret_t
-    stop_n    = trades_df["stopped"].sum()
-
-    eq = equity_df["cum_ret"].values + 1
-    roll_max = np.maximum.accumulate(eq)
-    dd = (eq - roll_max) / roll_max
-    max_dd = float(dd.min()) * 100
-
-    daily_rets = equity_df["port_ret"].values
-    sharpe = float(np.mean(daily_rets) / np.std(daily_rets) * np.sqrt(252)) \
-             if np.std(daily_rets) > 0 else 0.0
-
-    bt_start_date = equity_df["date"].min().date()
-    bt_end_date   = equity_df["date"].max().date()
-
-    print("\n" + "="*55)
-    print(f"Walk-Forward OOS 回測結果")
-    print(f"回測期間: {bt_start_date} ~ {bt_end_date}  Folds: {N_FOLDS}")
-    print(f"選股數: top {TOP_N}  停損: {STOP_LOSS*100:.0f}%  每邊成本: {COST_RT*100:.4f}%")
-    print("="*55)
-    print(f"總交易筆數  : {n_trades}")
-    print(f"勝率       : {win_rate:.1f}%")
-    print(f"平均單筆報酬: {avg_ret:+.3f}%")
-    print(f"單日停損筆數: {stop_n} ({stop_n/n_trades*100:.1f}%)")
-    print(f"策略總報酬  : {total_ret:+.2f}%")
-    print(f"基準總報酬  : {bm_ret_t:+.2f}%")
-    print(f"超額報酬    : {excess:+.2f}%")
-    print(f"最大回撤    : {max_dd:.2f}%")
-    print(f"年化 Sharpe : {sharpe:.3f}")
-    print("="*55)
-
-    equity_df["month"] = pd.to_datetime(equity_df["date"]).dt.to_period("M")
-    monthly = equity_df.groupby("month").agg(
-        port=pd.NamedAgg("port_ret", lambda x: (1 + x).prod() - 1),
-        bm=pd.NamedAgg("bm_ret",   lambda x: (1 + x).prod() - 1),
-    )
-    monthly["excess"] = monthly["port"] - monthly["bm"]
-    print("\n月分装報酬 (%):")
-    print((monthly * 100).round(2).to_string())
+    summarize(trades_df, equity_df, N_FOLDS, TOP_N)
     print(f"\n輸出: {OUT_TRADES}")
     print(f"輸出: {OUT_EQUITY}")
 
