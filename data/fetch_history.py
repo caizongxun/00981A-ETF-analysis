@@ -8,8 +8,8 @@
   營收類: rev_mom_1m, rev_mom_3m, rev_yoy  (來源: FinMind API)
 
 執行： python data/fetch_history.py
-選填 FinMind token (.呢已註冊免費資料量更大)：
-  https://finmindtrade.com/ 註冊後設定 FINMIND_TOKEN 環境變數，或寫入 .finmind_token
+選填 FinMind token：
+  https://finmindtrade.com/ 註冊後將 token 寫入 .finmind_token
 """
 import os
 import requests
@@ -61,14 +61,16 @@ HEADERS_BASE = {
 }
 _SUFFIX_CACHE: dict = {}
 
-# ── FinMind token ──
 _FINMIND_TOKEN = (
     TOKEN_FILE.read_text(encoding="utf-8").strip() if TOKEN_FILE.exists()
     else os.environ.get("FINMIND_TOKEN", "")
 )
+_FINMIND_REV_CACHE: dict = {}
 
-# ── FinMind 營收大表，一次拉全部再查 ──
-_FINMIND_REV_CACHE: dict[str, pd.DataFrame] = {}  # stock_id -> DataFrame
+
+def cbrt(x: float) -> float:
+    """\u771f實數立方根，支援負數（避免 **1/3 產生複數）"""
+    return float(np.sign(x) * abs(x) ** (1 / 3))
 
 
 def get_valid_symbol(stock_id):
@@ -108,13 +110,8 @@ def fetch_holdings_by_date(query_date, cookie, retries=4, backoff=5.0):
 
 
 def fetch_revenue_finmind(stock_id: str) -> pd.DataFrame:
-    """
-    從 FinMind 一次拉出該股全部月營收展，回傳 DataFrame(date, revenue)
-    date 格式: YYYY-MM-DD (每月 10 日公布)
-    """
     if stock_id in _FINMIND_REV_CACHE:
         return _FINMIND_REV_CACHE[stock_id]
-
     params = {
         "dataset": "TaiwanStockMonthRevenue",
         "data_id": stock_id,
@@ -140,16 +137,11 @@ def fetch_revenue_finmind(stock_id: str) -> pd.DataFrame:
     return empty
 
 
-def get_revenue_for_month(stock_id: str, year_month: str) -> float | None:
-    """
-    取得指定年月的營收。
-    FinMind date 格式是 YYYY-MM-10 (每月 10 日公布)
-    """
+def get_revenue_for_month(stock_id: str, year_month: str):
     df = fetch_revenue_finmind(stock_id)
     if df.empty:
         return None
     ym = pd.Timestamp(year_month + "-01")
-    # 找對應年月的資料 (容許差 10 天)
     mask = (df["date"].dt.year == ym.year) & (df["date"].dt.month == ym.month)
     if not mask.any():
         return None
@@ -157,30 +149,31 @@ def get_revenue_for_month(stock_id: str, year_month: str) -> float | None:
 
 
 def calc_rev_features(stock_id: str, as_of_period: str, rev_cache: dict) -> dict:
-    """
-    rev_cache 在這裡只用來記錄已處理過的 stock_id，避免重複請求
-    """
     as_of_dt    = pd.Timestamp(as_of_period + "-01")
     rev_month   = (as_of_dt - relativedelta(months=1)).strftime("%Y-%m")
     rev_month_2 = (as_of_dt - relativedelta(months=2)).strftime("%Y-%m")
     rev_month_3 = (as_of_dt - relativedelta(months=3)).strftime("%Y-%m")
     rev_yoy_m   = (as_of_dt - relativedelta(months=13)).strftime("%Y-%m")
 
-    # 確保已載入該股的 FinMind 資料
     if stock_id not in rev_cache:
-        fetch_revenue_finmind(stock_id)  # 預載到 _FINMIND_REV_CACHE
+        fetch_revenue_finmind(stock_id)
         rev_cache[stock_id] = True
-        time.sleep(0.3)  # 防頂限流
+        time.sleep(0.3)
 
-    r0  = get_revenue_for_month(stock_id, rev_month)
-    r1  = get_revenue_for_month(stock_id, rev_month_2)
-    r2  = get_revenue_for_month(stock_id, rev_month_3)
-    ry  = get_revenue_for_month(stock_id, rev_yoy_m)
+    r0 = get_revenue_for_month(stock_id, rev_month)
+    r1 = get_revenue_for_month(stock_id, rev_month_2)
+    r2 = get_revenue_for_month(stock_id, rev_month_3)
+    ry = get_revenue_for_month(stock_id, rev_yoy_m)
+
+    # rev_mom_3m 用立方根，支援負營收的情況
+    rev_mom_3m = np.nan
+    if r0 and r2 and r2 != 0:
+        rev_mom_3m = cbrt(r0 / r2) - 1
 
     return {
-        "rev_mom_1m": float(r0/r1 - 1)        if r0 and r1 and r1 > 0 else np.nan,
-        "rev_mom_3m": float((r0/r2)**(1/3)-1) if r0 and r2 and r2 > 0 else np.nan,
-        "rev_yoy":    float(r0/ry - 1)         if r0 and ry and ry > 0  else np.nan,
+        "rev_mom_1m": float(r0 / r1 - 1) if r0 and r1 and r1 != 0 else np.nan,
+        "rev_mom_3m": float(rev_mom_3m),
+        "rev_yoy":    float(r0 / ry - 1) if r0 and ry and ry != 0  else np.nan,
     }
 
 
@@ -191,21 +184,21 @@ def calc_pit_features(closes, volumes, market, as_of):
     if len(c) < 20:
         return None
     p0 = float(c.iloc[-1])
-    def mom(n): return float(c.iloc[-1]/c.iloc[-n]-1) if len(c) >= n else np.nan
-    vol20 = float(c.pct_change().tail(20).std()*np.sqrt(252)) if len(c) >= 20 else np.nan
-    vol60 = float(c.pct_change().tail(60).std()*np.sqrt(252)) if len(c) >= 60 else np.nan
+    def mom(n): return float(c.iloc[-1] / c.iloc[-n] - 1) if len(c) >= n else np.nan
+    vol20 = float(c.pct_change().tail(20).std() * np.sqrt(252)) if len(c) >= 20 else np.nan
+    vol60 = float(c.pct_change().tail(60).std() * np.sqrt(252)) if len(c) >= 60 else np.nan
     ma60  = float(c.tail(60).mean()) if len(c) >= 60 else np.nan
-    rs    = float(c.iloc[-1]/c.iloc[-20] - m.iloc[-1]/m.iloc[-20]) if len(m) >= 20 else np.nan
+    rs    = float(c.iloc[-1] / c.iloc[-20] - m.iloc[-1] / m.iloc[-20]) if len(m) >= 20 else np.nan
     pc    = c.tail(21)
-    pr    = float((pc.max()-pc.min())/pc.min()) if len(pc) >= 5 else np.nan
+    pr    = float((pc.max() - pc.min()) / pc.min()) if len(pc) >= 5 else np.nan
     c52   = c.tail(252)
     p52h, p52l = float(c52.max()), float(c52.min())
-    p52pct = float((p0-p52l)/(p52h-p52l)) if p52h > p52l else np.nan
+    p52pct = float((p0 - p52l) / (p52h - p52l)) if p52h > p52l else np.nan
     vr, lt = np.nan, np.nan
     if len(v) >= 60:
         a20 = float(v.tail(20).mean())
         a60 = float(v.tail(60).mean())
-        vr  = a20/a60 if a60 > 0 else np.nan
+        vr  = a20 / a60 if a60 > 0 else np.nan
         lt  = float(np.log1p(a20))
     return {
         "mom_1m": mom(21), "mom_3m": mom(63), "mom_6m": mom(126),
@@ -297,10 +290,10 @@ if __name__ == "__main__":
     print("  0050 OK")
 
     print("\n計算各期 PIT 特徵 (營收將從 FinMind 一次拉取)...")
-    rev_cache = {}  # 只記錄已處理過的 stock_id
+    rev_cache = {}
     all_rows = []
     for period, holding_ids in sorted(period_holdings.items()):
-        period_end = pd.Timestamp(period+"-01") + relativedelta(months=1) - timedelta(days=1)
+        period_end = pd.Timestamp(period + "-01") + relativedelta(months=1) - timedelta(days=1)
         as_of = pd.Timestamp(period_end)
         n1 = n0 = rev_ok = rev_fail = 0
         for tk, sym in valid_universe.items():
@@ -325,7 +318,7 @@ if __name__ == "__main__":
     hist_path = DATA_DIR / "holdings_history.csv"
     full.to_csv(hist_path, index=False, encoding="utf-8-sig")
     print(f"\n完成! {hist_path} ({len(full)} 筆)")
-    nan_rates = full[[c for c in full.columns if c not in ["stock_id","period","in_etf"]]].isna().mean()
+    nan_rates = full[[c for c in full.columns if c not in ["stock_id", "period", "in_etf"]]].isna().mean()
     for col, r in nan_rates[nan_rates > 0.1].items():
         print(f"  {col} NaN: {r*100:.0f}%")
     print("接下來執行: python backtest/walk_forward.py")
