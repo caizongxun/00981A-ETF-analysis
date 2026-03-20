@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-日頻模型回測系統 - Walk-Forward Out-of-Sample v9
+日頻模型回測系統 - Walk-Forward Out-of-Sample v10
 
-核心改變 (vs v8):
-  - 模型改為 LGBMRegressor，直接預測 fwd_rel_3d
-  - 選股邏輯: predicted_rel 最高的 top N
-  - 空手條件: 所有候選股 predicted_rel < 0 且市場空頭時跳過
-  - 持倉報酬使用 fwd_ret_3d (實際個股報酬)
+核心改變 (vs v9):
+  - 每日重新評分，持有 predicted_rel 最高 top N
+  - 換股邏輯: 只賣出不在新 top N 的股票，只買入新進 top N 的股票
+  - 續抱的股票不收手續費
+  - 持倉報酬 = 每日 fwd_ret_1d 累積
+  - 空頭保護: 市場空頭 + 所有 predicted_rel < 0 → 全部清倉空手
 
 執行: python daily/backtest.py
 """
 import sys
 import json
-import random
 from pathlib import Path
 
 import pandas as pd
@@ -35,11 +35,8 @@ STOP_LOSS        = -0.10
 UP_CAP           =  0.15
 COST_RT          = 0.001425
 SLIPPAGE_RT      = 0.003
-LIQUIDITY_FAIL   = 0.05
-HOLD_DAYS        = 3
 INIT_CAPITAL     = 10_000
-MIN_PRED_REL     = 0.0     # predicted_rel 低於此值不進場 (空頭保護)
-RANDOM_SEED      = 42
+MIN_PRED_REL     = 0.0
 
 
 def load_feat_cols():
@@ -82,34 +79,26 @@ def train_fold_reg(X_tr, y_tr):
         import lightgbm as lgb
     except ImportError:
         print("[ERROR] pip install lightgbm"); sys.exit(1)
-
     model = lgb.LGBMRegressor(
-        n_estimators=800,
-        learning_rate=0.02,
-        num_leaves=31,
-        max_depth=5,
-        min_child_samples=20,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
-        random_state=42,
-        n_jobs=-1,
-        verbose=-1,
+        n_estimators=800, learning_rate=0.02,
+        num_leaves=31, max_depth=5,
+        min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=0.1, reg_lambda=0.1,
+        random_state=42, n_jobs=-1, verbose=-1,
     )
     model.fit(X_tr, y_tr)
     return model
 
 
-def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
+def summarize(trades_df, equity_df, n_folds, top_n):
     n_trades   = len(trades_df)
-    win_rate   = (trades_df["adj_ret"] > 0).mean() * 100
-    avg_ret    = trades_df["adj_ret"].mean() * 100
+    win_rate   = (trades_df["adj_ret"] > 0).mean() * 100 if n_trades > 0 else 0
+    avg_ret    = trades_df["adj_ret"].mean() * 100 if n_trades > 0 else 0
     total_ret  = equity_df["cum_ret"].iloc[-1] * 100
     bm_ret_t   = equity_df["bm_cum_ret"].iloc[-1] * 100
     excess     = total_ret - bm_ret_t
-    liq_fail_n = trades_df["liq_failed"].sum()
     skip_days  = int(equity_df["skipped"].sum()) if "skipped" in equity_df.columns else 0
+    n_rebal    = int((trades_df["action"] == "buy").sum()) if "action" in trades_df.columns else n_trades
 
     eq       = equity_df["cum_ret"].values + 1
     roll_max = np.maximum.accumulate(eq)
@@ -123,7 +112,7 @@ def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
     ann_ret = float((1 + total_ret / 100) ** (1 / n_years) - 1) * 100 if n_years > 0 else 0.0
     bm_ann  = float((1 + bm_ret_t  / 100) ** (1 / n_years) - 1) * 100 if n_years > 0 else 0.0
 
-    eq_rets = equity_df["port_ret"].values / hold_days
+    eq_rets = equity_df["port_ret"].values
     sharpe  = float(np.mean(eq_rets) / np.std(eq_rets) * np.sqrt(252)) \
               if np.std(eq_rets) > 0 else 0.0
 
@@ -133,13 +122,12 @@ def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
     print("Walk-Forward OOS 回測結果  (基準: 0050)")
     print(f"回測期間: {pd.Timestamp(bt_s).date()} ~ {pd.Timestamp(bt_e).date()}  "
           f"({n_calendar_days}日/{n_years:.2f}年)  Folds: {n_folds}")
-    print(f"選股數: top {top_n}  持有: {hold_days}天  MIN_PRED_REL: {MIN_PRED_REL}")
-    print(f"交易成本: {(COST_RT+SLIPPAGE_RT)*100:.4f}%/邊  流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  (共 {liq_fail_n} 筆)")
-    print(f"空手跳過次數: {skip_days}")
+    print(f"選股數: top {top_n}  每日換股  MIN_PRED_REL: {MIN_PRED_REL}")
+    print(f"交易成本: {(COST_RT+SLIPPAGE_RT)*100:.4f}%/邊  空手跳過: {skip_days} 天")
     print("="*60)
     print(f"起始資金      : {INIT_CAPITAL:,.0f} NTD")
     print(f"最終資金      : {final_capital:,.0f} NTD")
-    print(f"總交易筆數    : {n_trades}")
+    print(f"買入筆數      : {n_rebal}")
     print(f"勝率         : {win_rate:.1f}%")
     print(f"平均單筆報酬  : {avg_ret:+.3f}%")
     print(f"策略總報酬    : {total_ret:+.2f}%")
@@ -169,7 +157,6 @@ def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
 
 
 def run_backtest():
-    rng = random.Random(RANDOM_SEED)
     feat_cols, model_type = load_feat_cols()
 
     print(f"讀取 {IN_CSV} ...")
@@ -177,25 +164,27 @@ def run_backtest():
     df.sort_values(["date", "stock_id"], inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    fwd_col = "fwd_ret_3d" if "fwd_ret_3d" in df.columns else "fwd_ret_1d"
-    rel_col = "fwd_rel_3d"
-
-    if fwd_col not in df.columns:
+    # 每日報酬欄位
+    if "fwd_ret_1d" not in df.columns:
         print("[ERROR] 請先執行 python daily/build_features.py")
         sys.exit(1)
 
-    df[fwd_col] = df[fwd_col].clip(STOP_LOSS, UP_CAP)
+    df["fwd_ret_1d"] = df["fwd_ret_1d"].clip(STOP_LOSS, UP_CAP)
+    rel_col = "fwd_rel_3d"
 
     avail = [c for c in feat_cols if c in df.columns]
-    df.dropna(subset=avail + [fwd_col], inplace=True)
+    df.dropna(subset=avail + ["fwd_ret_1d"], inplace=True)
 
-    all_dates  = sorted(df["date"].unique())
-    total_days = len(all_dates)
-    date_idx   = {d: i for i, d in enumerate(all_dates)}
-    print(f"資料範圍: {all_dates[0].date()} ~ {all_dates[-1].date()} ({total_days} 交易日)")
-    print(f"持有天數: {HOLD_DAYS}天  MIN_PRED_REL: {MIN_PRED_REL}  滑價: {SLIPPAGE_RT*100:.2f}%")
-    print(f"流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  起始資金: {INIT_CAPITAL:,} NTD")
-    print(f"模型類型: {model_type}  使用特徵: {len(avail)} 個")
+    # 建立快速查詢 index: (stock_id, date) -> fwd_ret_1d
+    df.set_index(["stock_id", "date"], inplace=True)
+    df.sort_index(inplace=True)
+
+    all_dates = sorted(df.index.get_level_values("date").unique())
+    print(f"資料範圍: {all_dates[0].date()} ~ {all_dates[-1].date()} ({len(all_dates)} 交易日)")
+    print(f"每日換股模式  TOP_N={TOP_N}  MIN_PRED_REL={MIN_PRED_REL}  滑價: {SLIPPAGE_RT*100:.2f}%")
+    print(f"起始資金: {INIT_CAPITAL:,} NTD  模型類型: {model_type}  特徵: {len(avail)} 個")
+
+    df_flat = df.reset_index()
 
     min_train_days = MIN_TRAIN_MONTHS * 21
     bt_dates  = all_dates[min_train_days:]
@@ -218,142 +207,123 @@ def run_backtest():
 
     all_trades  = []
     all_eq_rows = []
-    cum_ret = 0.0
-    bm_cum  = 0.0
-    capital = float(INIT_CAPITAL)
-    carry_over = {}
+    cum_ret  = 0.0
+    bm_cum   = 0.0
+    capital  = float(INIT_CAPITAL)
+    holdings = set()   # 目前持有的 stock_id 集合 (等權)
+    cost_one = (COST_RT + SLIPPAGE_RT) * 2  # 買+賣單邊合計
 
     for fold_i, (fold_start, fold_end) in enumerate(folds):
         print(f"\n[Fold {fold_i+1}/{N_FOLDS}] 訓練中...", end=" ", flush=True)
-        train_df = df[df["date"] < fold_start]
-        test_df  = df[(df["date"] >= fold_start) & (df["date"] <= fold_end)]
+        train_df = df_flat[df_flat["date"] < fold_start]
+        test_df  = df_flat[(df_flat["date"] >= fold_start) & (df_flat["date"] <= fold_end)]
 
-        X_tr = pd.DataFrame(train_df[avail].values.astype(np.float32), columns=avail)
-
-        # 回歸模型: 目標為 fwd_rel_3d (若有)，否則 fwd_ret_3d
-        y_col = rel_col if rel_col in train_df.columns else fwd_col
+        X_tr = train_df[avail].astype(np.float32)
+        y_col = rel_col if rel_col in train_df.columns else "fwd_ret_1d"
         y_tr  = train_df[y_col].fillna(0).values.astype(np.float32)
-
         model = train_fold_reg(X_tr, y_tr)
         print(f"完成  (訓練 {len(X_tr):,} 筆 | 測試 {len(test_df):,} 筆)")
 
-        test_dates     = sorted(test_df["date"].unique())
-        signal_indices = list(range(0, len(test_dates), HOLD_DAYS))
+        test_dates = sorted(test_df["date"].unique())
 
-        for sig_i in signal_indices:
-            dt = test_dates[sig_i]
+        for dt in test_dates:
             bear = is_market_bear(bm_ret_series, dt, window=20)
 
             day_df = test_df[test_df["date"] == dt].dropna(subset=avail).copy()
-            if len(day_df) < 1:
+            if len(day_df) == 0:
                 continue
 
-            X_day = pd.DataFrame(day_df[avail].values.astype(np.float32), columns=avail)
+            X_day = day_df[avail].astype(np.float32)
+            day_df = day_df.copy()
             day_df["predicted_rel"] = model.predict(X_day)
 
-            # 空手條件: 空頭 + 所有預測值都 < MIN_PRED_REL
-            if bear and (day_df["predicted_rel"].max() < MIN_PRED_REL):
+            # 空頭保護: 全部預測值 < 0 且市場空頭 → 清倉空手
+            if bear and day_df["predicted_rel"].max() < MIN_PRED_REL:
+                # 賣掉所有持倉
+                n_sell = len(holdings)
+                if n_sell > 0:
+                    sell_cost = cost_one * n_sell / TOP_N  # 按比例計算成本
+                    capital  *= (1 - sell_cost)
+                    for sid in holdings:
+                        all_trades.append({
+                            "fold": fold_i+1, "date": dt, "stock_id": sid,
+                            "action": "sell_bear", "predicted_rel": None,
+                            "adj_ret": -cost_one, "liq_failed": 0,
+                        })
+                    holdings = set()
+
+                bm_r = float(bm_ret_series.get(dt, 0.0))
+                bm_cum += np.log1p(bm_r)
                 all_eq_rows.append({
                     "date": dt, "fold": fold_i+1,
-                    "port_ret": 0.0, "bm_ret": 0.0,
+                    "port_ret": 0.0, "bm_ret": round(bm_r, 6),
                     "cum_ret": round(float(np.expm1(cum_ret)), 6),
                     "bm_cum_ret": round(float(np.expm1(bm_cum)), 6),
-                    "capital": round(capital, 2),
-                    "skipped": 1,
+                    "capital": round(capital, 2), "skipped": 1,
                 })
                 continue
 
-            picks = day_df.nlargest(min(TOP_N, len(day_df)), "predicted_rel")
+            # 今天 top N
+            new_top = set(day_df.nlargest(min(TOP_N, len(day_df)), "predicted_rel")["stock_id"])
 
-            raw_rets  = []
-            liq_flags = []
+            # 換股操作
+            to_sell = holdings - new_top      # 賣出
+            to_buy  = new_top  - holdings     # 買入
+            # holdings 不變的部分 = holdings & new_top (續抱，不收費)
 
-            for _, row in picks.iterrows():
-                sid = row["stock_id"]
+            n_sell = len(to_sell)
+            n_buy  = len(to_buy)
 
-                if rng.random() < LIQUIDITY_FAIL:
-                    fallback = carry_over.pop(sid, 0.0)
-                    raw_rets.append(fallback)
-                    liq_flags.append(1)
-                    continue
+            # 計算今日持倉報酬 (所有持股，含續抱與新買)
+            # 新買的股票今天還沒持有，從明天開始算報酬，故只算「昨天就持有」的部分
+            port_ret = 0.0
+            if len(holdings) > 0:
+                daily_rets = []
+                for sid in holdings:
+                    try:
+                        r = float(df.loc[(sid, dt), "fwd_ret_1d"])
+                    except KeyError:
+                        r = 0.0
+                    daily_rets.append(r)
+                port_ret = float(np.mean(daily_rets))
 
-                si = date_idx.get(dt)
-                if si is None:
-                    raw_rets.append(np.nan); liq_flags.append(0); continue
+            # 扣除換股成本: 賣出 + 買入各收一次手續費，按倉位比例
+            if len(new_top) > 0:
+                sell_cost_total = cost_one * n_sell / len(new_top)
+                buy_cost_total  = cost_one * n_buy  / len(new_top)
+                port_ret -= (sell_cost_total + buy_cost_total)
 
-                exit_i  = min(si + HOLD_DAYS, len(all_dates) - 1)
-
-                # 優先使用 fwd_ret_3d (信號當天已計算好的欄位)
-                cur = df[(df["stock_id"] == sid) & (df["date"] == dt)]
-                if len(cur) > 0 and fwd_col in cur.columns:
-                    cum = float(cur[fwd_col].values[0])
-                else:
-                    hold_df = df[(df["stock_id"] == sid) &
-                                 (df["date"] >  dt) &
-                                 (df["date"] <= all_dates[exit_i])]
-                    cum = float((1 + hold_df["fwd_ret_1d"]).prod() - 1) \
-                          if not hold_df.empty else 0.0
-
-                if rng.random() < LIQUIDITY_FAIL:
-                    carry_over[sid] = cum
-                    raw_rets.append(0.0)
-                    liq_flags.append(1)
-                else:
-                    carry_over.pop(sid, None)
-                    raw_rets.append(cum)
-                    liq_flags.append(0)
-
-            raw_rets  = np.array(raw_rets, dtype=float)
-            liq_flags = np.array(liq_flags, dtype=int)
-            valid     = ~np.isnan(raw_rets)
-            if valid.sum() == 0:
-                continue
-
-            raw_rets_v = raw_rets[valid]
-            liq_v      = liq_flags[valid]
-
-            cost_per_trade = (COST_RT + SLIPPAGE_RT) * 2
-            adj_rets = raw_rets_v - np.where(liq_v == 0, cost_per_trade, 0.0)
-            port_ret = float(np.mean(adj_rets))
-
-            capital = capital * (1 + port_ret)
-
-            si     = date_idx.get(dt)
-            exit_i = min(si + HOLD_DAYS, len(all_dates) - 1)
-            bm_window = bm_ret_series[
-                (bm_ret_series.index >  dt) &
-                (bm_ret_series.index <= all_dates[exit_i])
-            ]
-            bm_ret = float((1 + bm_window).prod() - 1) if len(bm_window) > 0 else 0.0
-
+            holdings = new_top
+            capital *= (1 + port_ret)
             cum_ret += np.log1p(port_ret)
-            bm_cum  += np.log1p(bm_ret)
+
+            bm_r = float(bm_ret_series.get(dt, 0.0))
+            bm_cum += np.log1p(bm_r)
 
             all_eq_rows.append({
                 "date":       dt,
                 "fold":       fold_i + 1,
                 "port_ret":   round(port_ret, 6),
-                "bm_ret":     round(bm_ret,   6),
+                "bm_ret":     round(bm_r, 6),
                 "cum_ret":    round(float(np.expm1(cum_ret)), 6),
-                "bm_cum_ret": round(float(np.expm1(bm_cum)),  6),
+                "bm_cum_ret": round(float(np.expm1(bm_cum)), 6),
                 "capital":    round(capital, 2),
                 "skipped":    0,
             })
 
-            valid_idx = np.where(valid)[0]
-            for k, j in enumerate(valid_idx):
-                row_p = picks.iloc[j]
-                r     = float(raw_rets_v[k])
-                r_adj = r - (cost_per_trade if liq_v[k] == 0 else 0.0)
+            # 記錄交易
+            pred_map = dict(zip(day_df["stock_id"], day_df["predicted_rel"]))
+            for sid in to_sell:
                 all_trades.append({
-                    "fold":          fold_i + 1,
-                    "signal_date":   dt,
-                    "stock_id":      row_p["stock_id"],
-                    "predicted_rel": round(float(row_p["predicted_rel"]), 4),
-                    "entry_close":   round(float(row_p["close"]), 2),
-                    "raw_ret":       round(r,     6),
-                    "adj_ret":       round(r_adj, 6),
-                    "liq_failed":    int(liq_v[k]),
+                    "fold": fold_i+1, "date": dt, "stock_id": sid,
+                    "action": "sell", "predicted_rel": round(pred_map.get(sid, 0.0), 4),
+                    "adj_ret": -cost_one, "liq_failed": 0,
+                })
+            for sid in to_buy:
+                all_trades.append({
+                    "fold": fold_i+1, "date": dt, "stock_id": sid,
+                    "action": "buy", "predicted_rel": round(pred_map.get(sid, 0.0), 4),
+                    "adj_ret": -cost_one, "liq_failed": 0,
                 })
 
     trades_df = pd.DataFrame(all_trades)
@@ -362,7 +332,7 @@ def run_backtest():
     trades_df.to_csv(OUT_TRADES, index=False, encoding="utf-8-sig")
     equity_df.to_csv(OUT_EQUITY, index=False, encoding="utf-8-sig")
 
-    summarize(trades_df, equity_df, N_FOLDS, TOP_N, HOLD_DAYS)
+    summarize(trades_df, equity_df, N_FOLDS, TOP_N)
     print(f"\n輸出: {OUT_TRADES}")
     print(f"輸出: {OUT_EQUITY}")
     return equity_df, trades_df
