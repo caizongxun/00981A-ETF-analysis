@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-日頻異常偵測模型訓練 - T+0 架構
+日頻異常偉測模型訓練 - T+0 架構
 執行: python daily/train_model.py
 """
 import sys
@@ -21,12 +21,26 @@ UP_MODEL   = MODEL_DIR / "daily_up_model.pkl"
 DOWN_MODEL = MODEL_DIR / "daily_down_model.pkl"
 FEAT_JSON  = MODEL_DIR / "daily_feature_cols.json"
 
-FEATURE_COLS = [
-    "vol_ratio_5d", "vol_ratio_20d", "vol_zscore_20d",
-    "ret_1d", "ret_5d", "high_low_pct",
-    "close_vs_ma5", "close_vs_ma20",
-    "inst_net_ratio", "margin_chg_pct",
-]
+# 無論 build_features.py 新增何種特徵，這裡自動收錄
+# 排除的欄位: meta 資訊、label、從 targets
+EXCLUDE_COLS = {
+    "date", "stock_id", "close", "adj_close",
+    "fwd_ret_1d", "label_up1", "label_down1",
+}
+
+NAN_THRESH = 0.50   # NaN 比例超過此閾値的特徵直接排除
+
+
+def auto_feature_cols(df: pd.DataFrame) -> list[str]:
+    """從 dataframe 自動選出有效特徵欄位"""
+    candidates = [c for c in df.columns if c not in EXCLUDE_COLS]
+    nan_rate   = df[candidates].isna().mean()
+    keep = [c for c in candidates if nan_rate[c] <= NAN_THRESH]
+    dropped = [c for c in candidates if nan_rate[c] > NAN_THRESH]
+    if dropped:
+        print(f"[INFO] NaN>{NAN_THRESH*100:.0f}% 排除特徵: {dropped}")
+    print(f"[INFO] 使用 {len(keep)} 個特徵: {keep}")
+    return keep
 
 
 def train_lgbm(X_tr: pd.DataFrame, y_train, X_vl: pd.DataFrame, y_val,
@@ -77,7 +91,7 @@ def train_lgbm(X_tr: pd.DataFrame, y_train, X_vl: pd.DataFrame, y_val,
     print(classification_report(y_val, (prob >= best_t).astype(int), zero_division=0))
 
     imp = pd.Series(model.feature_importances_, index=X_tr.columns)
-    print(f"  Top 5: {imp.nlargest(5).to_dict()}")
+    print(f"  Top 10: {imp.nlargest(10).to_dict()}")
     return model, float(best_t)
 
 
@@ -86,13 +100,14 @@ def main():
     df = pd.read_csv(IN_CSV, parse_dates=["date"])
     df.sort_values("date", inplace=True)
 
-    # 相容舊版 label 名稱 (label_up5 -> label_up1)
-    if "label_up1" not in df.columns and "label_up5" in df.columns:
-        print("[WARN] 偵測到舊版 label_up5，請先執行 python daily/build_features.py 重建特徵")
+    if "label_up1" not in df.columns:
+        print("[ERROR] 找不到 label_up1，請先執行 python daily/build_features.py")
         sys.exit(1)
 
-    avail = [c for c in FEATURE_COLS if c in df.columns]
-    df.dropna(subset=avail + ["label_up1", "label_down1"], inplace=True)
+    feat_cols = auto_feature_cols(df)
+
+    # dropna 只看 label，特徵的 NaN 由 LightGBM 內部處理
+    df.dropna(subset=["label_up1", "label_down1"], inplace=True)
     print(f"有效樣本: {len(df):,}")
 
     cutoff = df["date"].quantile(0.8)
@@ -101,8 +116,8 @@ def main():
     print(f"Train: {len(train):,} ({train['date'].min().date()} ~ {train['date'].max().date()})")
     print(f"Val  : {len(val):,}   ({val['date'].min().date()} ~ {val['date'].max().date()})")
 
-    X_tr = pd.DataFrame(train[avail].values.astype(np.float32), columns=avail)
-    X_vl = pd.DataFrame(val[avail].values.astype(np.float32),   columns=avail)
+    X_tr = train[feat_cols].astype(np.float32)
+    X_vl = val[feat_cols].astype(np.float32)
 
     print("\n--- 訓練隣日上漲模型 ---")
     up_model, up_thresh = train_lgbm(X_tr, train["label_up1"].values,
@@ -116,7 +131,7 @@ def main():
     with open(DOWN_MODEL, "wb") as f: pickle.dump(down_model, f)
     print(f"儲存: {DOWN_MODEL}")
 
-    meta = {"feature_cols": avail, "up_thresh": up_thresh, "down_thresh": down_thresh}
+    meta = {"feature_cols": feat_cols, "up_thresh": up_thresh, "down_thresh": down_thresh}
     with open(FEAT_JSON, "w") as f: json.dump(meta, f, indent=2)
     print(f"儲存特徵 + 閾値: {FEAT_JSON}")
     print("接下來執行: python daily/predict_today.py")
