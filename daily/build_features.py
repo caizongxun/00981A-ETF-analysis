@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-日頻特徵建構 - T+0 架構 v3
+日頻特徵建構 - T+0 架構 v4
 
 輸入:  data/daily_raw.csv
 輸出:  data/daily_features.csv
@@ -13,7 +13,7 @@
   技術指標: rsi_14
   法人融資: inst_net_ratio, inst_net_ratio_5d, margin_chg_pct, short_ratio
   成交金額: turnover_ratio
-標籤: label_up1 (T+1 報酬 > 3%), label_down1 (T+1 報酬 < -3%)
+標籤: label_up1 (T+1 報酬 > 2%), label_down1 (T+1 報酬 < -2%)
 """
 from pathlib import Path
 import pandas as pd
@@ -24,8 +24,8 @@ DATA_DIR = ROOT / "data"
 IN_CSV   = DATA_DIR / "daily_raw.csv"
 OUT_CSV  = DATA_DIR / "daily_features.csv"
 
-UP_THRESH   =  0.03   # 提高至 3%，只學強烈上漲信號
-DOWN_THRESH = -0.03   # 對應提高至 -3%
+UP_THRESH   =  0.02
+DOWN_THRESH = -0.02
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -124,7 +124,6 @@ def build(df: pd.DataFrame) -> pd.DataFrame:
             "date":              g["date"],
             "stock_id":          sid,
             "close":             c.values,
-            "atr_pct_raw":       atr_pct.shift(1).values,   # 保留原始 ATR 供動態停損用
             "vol_ratio_5d":      s(v / ma5_v.replace(0, np.nan)),
             "vol_ratio_20d":     s(v / ma20_v.replace(0, np.nan)),
             "vol_zscore_20d":    s(vz20),
@@ -157,7 +156,7 @@ def build(df: pd.DataFrame) -> pd.DataFrame:
     p99   = out["fwd_ret_1d"].quantile(0.99)
     p1    = out["fwd_ret_1d"].quantile(0.01)
     n_out = ((out["fwd_ret_1d"] > 0.097) | (out["fwd_ret_1d"] < -0.1)).sum()
-    nan_rate = out.drop(columns=["date","stock_id","close","atr_pct_raw",
+    nan_rate = out.drop(columns=["date","stock_id","close",
                                   "fwd_ret_1d","label_up1","label_down1"]).isna().mean()
     print(f"fwd_ret_1d p1={p1*100:.2f}%  p99={p99*100:.2f}%  "
           f"超上下限筆數: {n_out} ({n_out/len(out)*100:.1f}%)")

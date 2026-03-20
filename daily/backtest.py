@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-日頻模型回測系統 - Walk-Forward Out-of-Sample v8
+日頻模型回測系統 - Walk-Forward Out-of-Sample v9
 
 優化:
-  - MIN_SCORE: 最低 score 門檻，過濾低信心選股
-  - ATR 動態停損: 停損 = -ATR_MULT * atr_pct (取代固定 -3%)
-  - SLIPPAGE_RT: 滑價模擬
-  - LIQUIDITY_FAIL: 流動性失敗模擬
-  - INIT_CAPITAL: 起始資金 10,000 NTD
+  - MIN_SCORE=0.10: 過濾低信心選股
+  - 停損改回固定 -3%（穩定版本）
+  - SLIPPAGE_RT / LIQUIDITY_FAIL / INIT_CAPITAL 保留
 
 執行: python daily/backtest.py
 """
@@ -32,14 +30,14 @@ OUT_EQUITY = DATA_DIR / "backtest_equity.csv"
 N_FOLDS          = 6
 MIN_TRAIN_MONTHS = 12
 TOP_N            = 5
-ATR_MULT         = 1.5     # 動態停損: -ATR_MULT * atr_pct，替代固定 STOP_LOSS
-UP_CAP           = 0.097
+STOP_LOSS        = -0.03    # 固定停損 -3%
+UP_CAP           =  0.097
 COST_RT          = 0.001425
 SLIPPAGE_RT      = 0.003
 LIQUIDITY_FAIL   = 0.05
 HOLD_DAYS        = 3
 INIT_CAPITAL     = 10_000
-MIN_SCORE        = 0.10    # score < 0.1 不選
+MIN_SCORE        = 0.10     # score < 0.1 不選
 RANDOM_SEED      = 42
 
 
@@ -122,9 +120,9 @@ def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
     print("Walk-Forward OOS 回測結果  (基準: 0050)")
     print(f"回測期間: {pd.Timestamp(bt_s).date()} ~ {pd.Timestamp(bt_e).date()}  "
           f"({n_calendar_days}日/{n_years:.2f}年)  Folds: {n_folds}")
-    print(f"選股數: top {top_n}  持有: {hold_days}天  MIN_SCORE: {MIN_SCORE}")
-    print(f"停損: ATR x{ATR_MULT}  交易成本: {(COST_RT+SLIPPAGE_RT)*100:.4f}%/邊")
-    print(f"流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  (共 {liq_fail_n} 筆)  ATR停損觸發: {stopped_n} 筆")
+    print(f"選股數: top {top_n}  持有: {hold_days}天  MIN_SCORE: {MIN_SCORE}  停損: {STOP_LOSS*100:.0f}%")
+    print(f"交易成本: {(COST_RT+SLIPPAGE_RT)*100:.4f}%/邊  流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  (共 {liq_fail_n} 筆)")
+    print(f"停損觸發: {stopped_n} 筆")
     print("="*60)
     print(f"起始資金      : {INIT_CAPITAL:,.0f} NTD")
     print(f"最終資金      : {final_capital:,.0f} NTD")
@@ -170,8 +168,7 @@ def run_backtest():
         print("[ERROR] 請先執行 python daily/build_features.py")
         sys.exit(1)
 
-    # 動態停損: 用 atr_pct_raw 計算每筆的停損下限 (不預先 clip)
-    has_atr_raw = "atr_pct_raw" in df.columns
+    df["fwd_ret_1d"] = df["fwd_ret_1d"].clip(STOP_LOSS, UP_CAP)
 
     avail = [c for c in feat_cols if c in df.columns]
     has_down = "label_down1" in df.columns
@@ -181,7 +178,7 @@ def run_backtest():
     total_days = len(all_dates)
     date_idx   = {d: i for i, d in enumerate(all_dates)}
     print(f"資料範圍: {all_dates[0].date()} ~ {all_dates[-1].date()} ({total_days} 交易日)")
-    print(f"持有天數: {HOLD_DAYS}天  MIN_SCORE: {MIN_SCORE}  ATR停損倍數: x{ATR_MULT}")
+    print(f"持有天數: {HOLD_DAYS}天  MIN_SCORE: {MIN_SCORE}  停損: {STOP_LOSS*100:.0f}%")
     print(f"滑價: {SLIPPAGE_RT*100:.2f}%  流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  起始資金: {INIT_CAPITAL:,} NTD")
 
     min_train_days = MIN_TRAIN_MONTHS * 21
@@ -237,8 +234,8 @@ def run_backtest():
             day_df["dn_prob"] = dn_model.predict_proba(X_day)[:, 1]
             day_df["score"]   = day_df["up_prob"] - day_df["dn_prob"]
 
-            # MIN_SCORE 過濾 + score > 0
-            candidates = day_df[(day_df["score"] >= MIN_SCORE)]
+            # MIN_SCORE 過濾，無則降格選 score > 0
+            candidates = day_df[day_df["score"] >= MIN_SCORE]
             if len(candidates) == 0:
                 candidates = day_df[day_df["score"] > 0]
             if len(candidates) == 0:
@@ -252,10 +249,6 @@ def run_backtest():
 
             for _, row in picks.iterrows():
                 sid = row["stock_id"]
-
-                # 動態停損門檻
-                atr_val = float(row["atr_pct_raw"]) if has_atr_raw and not pd.isna(row.get("atr_pct_raw", np.nan)) else 0.03
-                dyn_stop = -ATR_MULT * max(atr_val, 0.005)  # 最低 -0.5% * 1.5 = -0.75%
 
                 if rng.random() < LIQUIDITY_FAIL:
                     fallback = carry_over.pop(sid, 0.0)
@@ -274,21 +267,20 @@ def run_backtest():
                              (df["date"] <= all_dates[exit_i])]
 
                 if hold_df.empty:
-                    r = float(row["fwd_ret_1d"])
-                    cum = max(r, dyn_stop * HOLD_DAYS)
-                    raw_rets.append(cum); liq_flags.append(0)
-                    stop_flags.append(int(r < dyn_stop * HOLD_DAYS))
+                    r = max(float(row["fwd_ret_1d"]), STOP_LOSS)
+                    raw_rets.append(r); liq_flags.append(0)
+                    stop_flags.append(int(float(row["fwd_ret_1d"]) <= STOP_LOSS))
                     continue
 
-                # 逐日模擬：觸及 ATR 停損即出場
+                # 逐日觸及停損模擬
                 cum = 0.0
                 stopped = False
                 for _, day_r in hold_df.iterrows():
                     daily_r = float(day_r["fwd_ret_1d"])
                     cum = (1 + cum) * (1 + daily_r) - 1
-                    if cum <= dyn_stop:
+                    if cum <= STOP_LOSS:
                         stopped = True
-                        cum = dyn_stop
+                        cum = STOP_LOSS
                         break
                 cum = min(cum, UP_CAP * HOLD_DAYS)
 
