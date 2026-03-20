@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-日頻模型回測系統 - Walk-Forward Out-of-Sample v2
+日頻模型回測系統 - Walk-Forward Out-of-Sample v3
 
-選股逻輯改善:
-  - 綜合評分 score = up_prob - down_prob (排除双向高波動股)
-  - ATR 過濾: 排除當日宇宙中 atr_pct > 80th percentile 的股票
-  - top N 由 score 排序選出
+選股逻輯:
+  1. 用 up_prob 主排序
+  2. score = up_prob - down_prob > 0 才納入候選（上漲機率必須 > 下跌機率）
+  3. 不再做 fold-level ATR 過濾，避免左右賭後尺
 
 執行: python daily/backtest.py
 """
@@ -32,7 +32,6 @@ TOP_N            = 5
 STOP_LOSS        = -0.03
 UP_CAP           =  0.097
 COST_RT          = 0.001425
-ATR_PCT_FILTER   = 0.80   # 排除 atr_pct > 80th percentile 的高波動股
 
 
 def load_feat_cols():
@@ -111,7 +110,7 @@ def summarize(trades_df, equity_df, n_folds, top_n):
     print("Walk-Forward OOS 回測結果  (基準: 0050)")
     print(f"回測期間: {bt_s} ~ {bt_e}  Folds: {n_folds}")
     print(f"選股數: top {top_n}  停損: {STOP_LOSS*100:.0f}%  上限: {UP_CAP*100:.1f}%  每邊成本: {COST_RT*100:.4f}%")
-    print(f"ATR 過濾: >{ATR_PCT_FILTER*100:.0f}th pct 排除")
+    print(f"選股邏輯: up_prob 排序 + score>0 過濾")
     print("="*55)
     print(f"總交易筆數    : {n_trades}")
     print(f"勝率         : {win_rate:.1f}%")
@@ -193,32 +192,26 @@ def run_backtest():
         up_model, dn_model = train_fold(
             X_tr,
             train_df["label_up1"].values,
-            train_df["label_down1"].values if has_down else np.zeros(len(train_df)),
+            train_df["label_down1"].values if has_down else np.zeros(len(train_df), dtype=np.float32),
         )
         print(f"完成  (訓練 {len(X_tr):,} 筆 | 測試 {len(test_df):,} 筆)")
 
-        # 預先計算此 fold 的 atr_pct 80th percentile
-        atr_thresh = None
-        if "atr_pct" in test_df.columns:
-            atr_thresh = test_df["atr_pct"].quantile(ATR_PCT_FILTER)
-
         for dt in sorted(test_df["date"].unique()):
             day_df = test_df[test_df["date"] == dt].dropna(subset=avail).copy()
-
-            # ATR 過濾: 排除當日高波動股
-            if atr_thresh is not None and "atr_pct" in day_df.columns:
-                day_df = day_df[day_df["atr_pct"] <= atr_thresh]
-
             if len(day_df) < TOP_N:
                 continue
 
             X_day = pd.DataFrame(day_df[avail].values.astype(np.float32), columns=avail)
             day_df["up_prob"] = up_model.predict_proba(X_day)[:, 1]
             day_df["dn_prob"] = dn_model.predict_proba(X_day)[:, 1]
-            # 綜合評分: 上漲機率 - 下跌機率
             day_df["score"]   = day_df["up_prob"] - day_df["dn_prob"]
 
-            picks    = day_df.nlargest(TOP_N, "score")
+            # score > 0: up_prob 必須 > down_prob 才入候選
+            candidates = day_df[day_df["score"] > 0]
+            if len(candidates) < TOP_N:
+                candidates = day_df  # 候選不足時 fallback 到全部
+
+            picks    = candidates.nlargest(TOP_N, "up_prob")
             raw_rets = picks["fwd_ret_1d"].values
             adj_rets = raw_rets - COST_RT * 2
             port_ret = float(np.mean(adj_rets))
