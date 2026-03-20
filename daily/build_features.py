@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-日頻特徵建構 - T+0 架構
+日頻特徵建構 - T+0 架構 v2
 
 輸入:  data/daily_raw.csv  (必須包含 close, adj_close 兩欄)
 輸出:  data/daily_features.csv
 
-設計原則:
-  close     = 未還原原始成交價  -> 計算 fwd_ret_1d (真實報酬)
-  adj_close = 還原權値價          -> 計算均線/動能/勢能特徵 (連續性準確)
-
-所有特徵是 T-1 收盤後已知資訊，label 是 T+1 報酬
+特徵清單 (22 個, 全部 T-1 收盤後已知):
+  量能類: vol_ratio_5d, vol_ratio_20d, vol_zscore_20d, obv_slope
+  報酬動能: ret_1d, ret_5d, ret_20d, mom_acc (20d 加速度)
+  價格結構: high_low_pct, close_vs_ma5, close_vs_ma20, close_vs_ma60
+               bb_pos (布林通道位置), atr_pct (ATR 百分比)
+  技術指標: rsi_14
+  法人融資: inst_net_ratio, inst_net_ratio_5d
+               margin_chg_pct, short_ratio (878d券/融資 比)
+  成交金額: turnover_ratio (adj 金額動能)
+標籤: label_up1 (T+1 報酬 > 2%), label_down1 (T+1 報酬 < -2%)
 """
 from pathlib import Path
 import pandas as pd
@@ -24,12 +29,19 @@ UP_THRESH   =  0.02
 DOWN_THRESH = -0.02
 
 
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period, min_periods=period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period, min_periods=period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
 def build(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df.sort_values(["stock_id", "date"], inplace=True)
 
-    # adj_close 必須存在
     if "adj_close" not in df.columns:
         raise ValueError(
             "daily_raw.csv 缺少 adj_close 欄位，"
@@ -39,72 +51,138 @@ def build(df: pd.DataFrame) -> pd.DataFrame:
     records = []
     for sid, g in df.groupby("stock_id"):
         g  = g.copy().reset_index(drop=True)
-        c  = g["close"].astype(float)      # 未還原: 用於報酬計算
-        ac = g["adj_close"].astype(float)  # 還原:   用於特徵計算
+        c  = g["close"].astype(float)
+        ac = g["adj_close"].astype(float)
         v  = g["volume"].astype(float)
-        h  = g["high"].astype(float)  if "high" in g.columns else ac
-        lo = g["low"].astype(float)   if "low"  in g.columns else ac
+        h  = g["high"].astype(float) if "high" in g.columns else ac
+        lo = g["low"].astype(float)  if "low"  in g.columns else ac
 
-        # 動能特徵: 用 adj_close 進行滾動計算，避免除權息日出現跟空
+        # --- 量能 ---
         ma5_v  = v.rolling(5,  min_periods=3).mean()
         ma20_v = v.rolling(20, min_periods=10).mean()
-        vz20   = (v - v.rolling(20, min_periods=10).mean()) / \
-                 v.rolling(20, min_periods=10).std().replace(0, np.nan)
+        vz20   = (v - ma20_v) / v.rolling(20, min_periods=10).std().replace(0, np.nan)
 
-        ret1  = ac.pct_change(1)   # 昨日報酬 (adj)
-        ret5  = ac.pct_change(5)
-        hlpct = (h - lo) / ac.replace(0, np.nan)
+        # OBV 趨势: OBV_5d_slope / avg_price
+        sign   = np.sign(ac.diff().fillna(0))
+        obv    = (sign * v).cumsum()
+        obv_slope = obv.diff(5) / ma20_v.replace(0, np.nan)
+
+        # --- 報酬動能 ---
+        ret1   = ac.pct_change(1)
+        ret5   = ac.pct_change(5)
+        ret20  = ac.pct_change(20)
+        mom_acc = ret5 - ac.pct_change(10).shift(5)  # 近5日 vs 前5日，加速度
+
+        # --- 價格結構 ---
+        hlpct  = (h - lo) / ac.replace(0, np.nan)
         ma5_c  = ac.rolling(5,  min_periods=3).mean()
         ma20_c = ac.rolling(20, min_periods=10).mean()
+        ma60_c = ac.rolling(60, min_periods=30).mean()
 
+        # 布林通道位置: (price - lower) / (upper - lower)
+        bb_mid = ma20_c
+        bb_std = ac.rolling(20, min_periods=10).std()
+        bb_upper = bb_mid + 2 * bb_std
+        bb_lower = bb_mid - 2 * bb_std
+        bb_pos   = (ac - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
+
+        # ATR 百分比
+        tr = pd.concat([
+            h - lo,
+            (h - ac.shift(1)).abs(),
+            (lo - ac.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        atr14   = tr.rolling(14, min_periods=7).mean()
+        atr_pct = atr14 / ac.replace(0, np.nan)
+
+        # RSI 14
+        rsi14 = rsi(ac, 14)
+
+        # --- 法人融資 ---
         inst = g["inst_net"].astype(float) if "inst_net" in g.columns \
                else pd.Series(np.nan, index=g.index)
-        inst_ratio = inst / ma20_v.replace(0, np.nan)
+        inst_ratio    = inst / ma20_v.replace(0, np.nan)
+        inst_ratio_5d = inst.rolling(5, min_periods=3).sum() / ma20_v.replace(0, np.nan)
 
         if {"MarginPurchaseBuy", "MarginPurchaseSell"}.issubset(g.columns):
-            margin_net = g["MarginPurchaseBuy"].astype(float) - \
-                         g["MarginPurchaseSell"].astype(float)
-            margin_chg = margin_net.rolling(5, min_periods=3).sum()
-            margin_chg_pct = margin_chg / \
-                g["MarginPurchaseBuy"].astype(float).rolling(20).mean().replace(0, np.nan)
+            mb  = g["MarginPurchaseBuy"].astype(float)
+            ms  = g["MarginPurchaseSell"].astype(float)
+            margin_net     = mb - ms
+            margin_chg     = margin_net.rolling(5, min_periods=3).sum()
+            margin_chg_pct = margin_chg / mb.rolling(20).mean().replace(0, np.nan)
         else:
             margin_chg_pct = pd.Series(np.nan, index=g.index)
 
-        # === T+1 隣日報酬: 用未還原 close 計算 ===
-        # c.shift(-1)/c - 1 = 明日未還原收盤 / 今日未還原收盤 - 1
-        # = 真實市場報酬，不包含除權息跳升
+        if {"ShortSaleBuy", "ShortSaleSell", "MarginPurchaseBuy"}.issubset(g.columns):
+            ss_bal = g["ShortSaleSell"].astype(float).rolling(5, min_periods=3).sum()
+            mg_bal = g["MarginPurchaseBuy"].astype(float).rolling(5, min_periods=3).sum()
+            short_ratio = ss_bal / mg_bal.replace(0, np.nan)
+        else:
+            short_ratio = pd.Series(np.nan, index=g.index)
+
+        # --- 成交金額動能 ---
+        turnover = ac * v
+        turnover_ma5  = turnover.rolling(5,  min_periods=3).mean()
+        turnover_ma20 = turnover.rolling(20, min_periods=10).mean()
+        turnover_ratio = turnover_ma5 / turnover_ma20.replace(0, np.nan)
+
+        # === T+1 未還原報酬 ===
         fwd1 = c.shift(-1) / c - 1
 
-        # 全部特徵 shift(1): row[date=T] 的 X = T-1 的特徵, y = T+1 報酬
+        def s(x): return x.shift(1).values  # 全部特徵延遲 1 天
+
         feat = pd.DataFrame({
-            "date":           g["date"],
-            "stock_id":       sid,
-            "close":          c.values,              # T 的未還原收盤，供回測展示用
-            "vol_ratio_5d":   (v / ma5_v.replace(0, np.nan)).shift(1).values,
-            "vol_ratio_20d":  (v / ma20_v.replace(0, np.nan)).shift(1).values,
-            "vol_zscore_20d": vz20.shift(1).values,
-            "ret_1d":         ret1.shift(1).values,
-            "ret_5d":         ret5.shift(1).values,
-            "high_low_pct":   hlpct.shift(1).values,
-            "close_vs_ma5":   (ac / ma5_c.replace(0, np.nan) - 1).shift(1).values,
-            "close_vs_ma20":  (ac / ma20_c.replace(0, np.nan) - 1).shift(1).values,
-            "inst_net_ratio": inst_ratio.shift(1).values,
-            "margin_chg_pct": margin_chg_pct.shift(1).values,
-            "fwd_ret_1d":     fwd1.values,           # T+1 未還原報酬 (真實)
-            "label_up1":      (fwd1 > UP_THRESH).astype(int).values,
-            "label_down1":    (fwd1 < DOWN_THRESH).astype(int).values,
+            "date":            g["date"],
+            "stock_id":        sid,
+            "close":           c.values,
+            # 量能
+            "vol_ratio_5d":    s(v / ma5_v.replace(0, np.nan)),
+            "vol_ratio_20d":   s(v / ma20_v.replace(0, np.nan)),
+            "vol_zscore_20d":  s(vz20),
+            "obv_slope":       s(obv_slope),
+            # 報酬動能
+            "ret_1d":          s(ret1),
+            "ret_5d":          s(ret5),
+            "ret_20d":         s(ret20),
+            "mom_acc":         s(mom_acc),
+            # 價格結構
+            "high_low_pct":    s(hlpct),
+            "close_vs_ma5":    s(ac / ma5_c.replace(0, np.nan) - 1),
+            "close_vs_ma20":   s(ac / ma20_c.replace(0, np.nan) - 1),
+            "close_vs_ma60":   s(ac / ma60_c.replace(0, np.nan) - 1),
+            "bb_pos":          s(bb_pos),
+            "atr_pct":         s(atr_pct),
+            # 技術指標
+            "rsi_14":          s(rsi14),
+            # 法人融資
+            "inst_net_ratio":  s(inst_ratio),
+            "inst_net_ratio_5d": s(inst_ratio_5d),
+            "margin_chg_pct":  s(margin_chg_pct),
+            "short_ratio":     s(short_ratio),
+            # 成交金額
+            "turnover_ratio":  s(turnover_ratio),
+            # label
+            "fwd_ret_1d":      fwd1.values,
+            "label_up1":       (fwd1 > UP_THRESH).astype(int).values,
+            "label_down1":     (fwd1 < DOWN_THRESH).astype(int).values,
         })
         records.append(feat)
 
     out = pd.concat(records, ignore_index=True)
     out.dropna(subset=["ret_1d", "vol_ratio_20d", "fwd_ret_1d"], inplace=True)
 
-    # 异常報酬輸出 (QC)
-    p99 = out["fwd_ret_1d"].quantile(0.99)
-    p1  = out["fwd_ret_1d"].quantile(0.01)
-    n_outlier = ((out["fwd_ret_1d"] > 0.097) | (out["fwd_ret_1d"] < -0.1)).sum()
+    p99      = out["fwd_ret_1d"].quantile(0.99)
+    p1       = out["fwd_ret_1d"].quantile(0.01)
+    n_out    = ((out["fwd_ret_1d"] > 0.097) | (out["fwd_ret_1d"] < -0.1)).sum()
+    nan_rate = out.drop(columns=["date","stock_id","close","fwd_ret_1d",
+                                  "label_up1","label_down1"]).isna().mean()
     print(f"fwd_ret_1d p1={p1*100:.2f}%  p99={p99*100:.2f}%  "
-          f"超上下限筆數: {n_outlier} ({n_outlier/len(out)*100:.1f}%)")
+          f"超上下限筆數: {n_out} ({n_out/len(out)*100:.1f}%)")
+    high_nan = nan_rate[nan_rate > 0.3]
+    if len(high_nan):
+        print("高 NaN 特徵 (>30%):")
+        for col, r in high_nan.items():
+            print(f"  {col}: {r*100:.0f}%")
 
     out.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
     print(f"完成: {OUT_CSV} ({len(out):,} 筆)")
