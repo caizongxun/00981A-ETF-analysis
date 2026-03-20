@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-日頻模型回測系統 - Walk-Forward Out-of-Sample v5
+日頻模型回測系統 - Walk-Forward Out-of-Sample v6
 
 選股逻輯:
   1. score > 0 過濾 (up_prob > down_prob)
@@ -94,22 +94,24 @@ def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
     roll_max = np.maximum.accumulate(eq)
     max_dd   = float(((eq - roll_max) / roll_max).min()) * 100
 
-    # Sharpe: 每筆交易一個報酬，年化到 252/hold_days 筆
-    rets   = trades_df.groupby("signal_date")["adj_ret"].mean()
-    sharpe = float(rets.mean() / rets.std() * np.sqrt(252 / hold_days)) \
-             if rets.std() > 0 else 0.0
+    # 年化: 用實際日曆天數來計算 (365.25 天/年)
+    bt_s = equity_df["date"].min()
+    bt_e = equity_df["date"].max()
+    n_calendar_days = (pd.Timestamp(bt_e) - pd.Timestamp(bt_s)).days
+    n_years = n_calendar_days / 365.25
 
-    n_periods = len(equity_df)
-    ann_factor = 252 / hold_days
-    ann_ret = float((1 + total_ret / 100) ** (ann_factor / n_periods) - 1) * 100
-    bm_ann  = float((1 + bm_ret_t  / 100) ** (ann_factor / n_periods) - 1) * 100
+    ann_ret = float((1 + total_ret / 100) ** (1 / n_years) - 1) * 100 if n_years > 0 else 0.0
+    bm_ann  = float((1 + bm_ret_t  / 100) ** (1 / n_years) - 1) * 100 if n_years > 0 else 0.0
 
-    bt_s = equity_df["date"].min().date()
-    bt_e = equity_df["date"].max().date()
+    # Sharpe: 每筆交易的日報酬 (port_ret / hold_days) 年化
+    eq_rets = equity_df["port_ret"].values / hold_days   # 轉招為日報酬
+    sharpe  = float(np.mean(eq_rets) / np.std(eq_rets) * np.sqrt(252)) \
+              if np.std(eq_rets) > 0 else 0.0
 
     print("\n" + "="*55)
     print("Walk-Forward OOS 回測結果  (基準: 0050)")
-    print(f"回測期間: {bt_s} ~ {bt_e}  Folds: {n_folds}")
+    print(f"回測期間: {pd.Timestamp(bt_s).date()} ~ {pd.Timestamp(bt_e).date()}  "
+          f"({n_calendar_days}日/{n_years:.2f}年)  Folds: {n_folds}")
     print(f"選股數: top {top_n}  持有: {hold_days}天  停損: {STOP_LOSS*100:.0f}%  每邊成本: {COST_RT*100:.4f}%")
     print("="*55)
     print(f"總交易筆數    : {n_trades}")
@@ -197,9 +199,6 @@ def run_backtest():
         print(f"完成  (訓練 {len(X_tr):,} 筆 | 測試 {len(test_df):,} 筆)")
 
         test_dates = sorted(test_df["date"].unique())
-
-        # 正確逻輯: 每隔 HOLD_DAYS 天才重新選股
-        # signal_dates: 第 0, HOLD_DAYS, 2*HOLD_DAYS, ... 天
         signal_indices = list(range(0, len(test_dates), HOLD_DAYS))
 
         for sig_i in signal_indices:
@@ -219,7 +218,6 @@ def run_backtest():
 
             picks = candidates.nlargest(TOP_N, "up_prob")
 
-            # 計算持有 HOLD_DAYS 天的累積報酬
             raw_rets = []
             for _, row in picks.iterrows():
                 sid = row["stock_id"]
@@ -231,7 +229,6 @@ def run_backtest():
                              (df["date"] >  dt) &
                              (df["date"] <= all_dates[exit_i])]
                 if hold_df.empty:
-                    # 資料不足時用單日報酬代替
                     raw_rets.append(float(row["fwd_ret_1d"])); continue
                 cum = float((1 + hold_df["fwd_ret_1d"]).prod() - 1)
                 raw_rets.append(cum)
@@ -239,11 +236,10 @@ def run_backtest():
             raw_rets = np.array(raw_rets, dtype=float)
             valid    = ~np.isnan(raw_rets)
             if valid.sum() == 0: continue
-            raw_rets = raw_rets[valid]
-            adj_rets = raw_rets - COST_RT * 2
+            raw_rets_valid = raw_rets[valid]
+            adj_rets = raw_rets_valid - COST_RT * 2
             port_ret = float(np.mean(adj_rets))
 
-            # 0050 基準: 同樣 HOLD_DAYS 天累積
             si     = date_idx.get(dt)
             exit_i = min(si + HOLD_DAYS, len(all_dates) - 1)
             bm_window = bm_ret_series[
@@ -264,9 +260,10 @@ def run_backtest():
                 "bm_cum_ret": round(float(np.expm1(bm_cum)),  6),
             })
 
-            for j, (_, row) in enumerate(picks.iterrows()):
-                if not valid[j]: continue
-                r     = float(raw_rets[j - (~valid[:j]).sum()])
+            valid_idx = np.where(valid)[0]
+            for k, j in enumerate(valid_idx):
+                row   = picks.iloc[j]
+                r     = float(raw_rets_valid[k])
                 r_adj = r - COST_RT * 2
                 all_trades.append({
                     "fold":        fold_i + 1,
