@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import sys
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -36,7 +39,7 @@ TRANS_COST   = 0.001425
 TAX_RATE     = 0.003
 
 _SUFFIX_CACHE: dict = {}
-def get_valid_symbol(stock_id: str):
+def get_valid_symbol(stock_id):
     if stock_id in _SUFFIX_CACHE:
         s = _SUFFIX_CACHE[stock_id]
         return f"{stock_id}{s}" if s else None
@@ -52,33 +55,35 @@ def get_valid_symbol(stock_id: str):
     return None
 
 
-def get_feature_cols(df: pd.DataFrame) -> list:
+def get_feature_cols(df):
     return [c for c in FEATURE_COLS_ALL if c in df.columns]
 
 
-def impute(df: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
-    """NaN 用訓練集中位數填漟，避免營收特徵無資料時訓練資料被大量排除"""
+def impute(df, feature_cols, medians=None):
+    """NaN 用訓練集中位數填漟，回傳 (df, medians_dict)"""
     df = df.copy()
+    if medians is None:
+        medians = {}
+        for col in feature_cols:
+            if col in df.columns:
+                v = df[col].dropna()
+                medians[col] = float(v.median()) if len(v) > 0 else 0.0
     for col in feature_cols:
         if col in df.columns:
-            med = df[col].median()
-            df[col] = df[col].fillna(med if not np.isnan(med) else 0)
-    return df
+            df[col] = df[col].fillna(medians.get(col, 0.0))
+    return df, medians
 
 
 def train_model(train_df, feature_cols):
-    df = impute(train_df, feature_cols)
-    # 要求兩類別各至少 5 筆
+    df, medians = impute(train_df, feature_cols)
     if df["in_etf"].nunique() < 2:
-        return None, None, np.nan
+        return None, None, None, np.nan
     if df["in_etf"].value_counts().min() < 5:
-        return None, None, np.nan
+        return None, None, None, np.nan
     X = df[feature_cols].values
     y = df["in_etf"].values
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
-    # 儲存訓練集中位數，預測時使用
-    scaler.impute_medians_ = {col: train_df[col].median() for col in feature_cols}
     rf = RandomForestClassifier(
         n_estimators=300, max_depth=5,
         class_weight="balanced", random_state=42
@@ -88,16 +93,11 @@ def train_model(train_df, feature_cols):
         auc = roc_auc_score(y, rf.predict_proba(Xs)[:, 1])
     except:
         auc = np.nan
-    return rf, scaler, auc
+    return rf, scaler, medians, auc
 
 
-def predict_top(model, scaler, feat_df, feature_cols):
-    df = feat_df.copy()
-    # 用訓練集中位數填漟
-    for col in feature_cols:
-        med = getattr(scaler, "impute_medians_", {}).get(col, 0)
-        df[col] = df[col].fillna(med if not np.isnan(float(med)) else 0)
-    df = df.dropna(subset=feature_cols)
+def predict_top(model, scaler, medians, feat_df, feature_cols):
+    df, _ = impute(feat_df, feature_cols, medians)
     if df.empty or model is None:
         return []
     proba = model.predict_proba(scaler.transform(df[feature_cols].values))
@@ -152,17 +152,18 @@ def run_walk_forward(history_df, price_df):
         predict_for = periods[i]
 
         train_df = history_df[history_df["period"] <= train_up_to]
-        model, scaler, train_auc = train_model(train_df, feature_cols)
+        model, scaler, medians, train_auc = train_model(train_df, feature_cols)
         if model is None:
             print(f"[SKIP] {predict_for}: 訓練資料不足")
             continue
 
         curr_feat = history_df[history_df["period"] == train_up_to].copy()
-        selected  = predict_top(model, scaler, curr_feat, feature_cols)
+        selected  = predict_top(model, scaler, medians, curr_feat, feature_cols)
 
-        # OOS AUC
-        actual_df = history_df[history_df["period"] == predict_for].copy()
-        actual_df = impute(actual_df, feature_cols)
+        actual_df, _ = impute(
+            history_df[history_df["period"] == predict_for].copy(),
+            feature_cols, medians
+        )
         oos_auc = np.nan
         if not actual_df.empty and actual_df["in_etf"].nunique() >= 2:
             try:
@@ -220,7 +221,7 @@ def run_walk_forward(history_df, price_df):
 
 def print_performance(nav_df, oos_df):
     if nav_df.empty:
-        print("[ERROR] 沒有任何有效期數可以展示")
+        print("[ERROR] 沒有任何有效期數")
         return
     total  = nav_df["nav"].iloc[-1] / INITIAL_CASH - 1
     annual = (1 + total) ** (12 / max(len(nav_df), 1)) - 1
@@ -234,10 +235,10 @@ def print_performance(nav_df, oos_df):
     print(f"最大回撤     : {max_dd*100:.2f}%")
     valid_oos = oos_df["oos_auc"].dropna()
     if len(valid_oos):
-        print(f"平均 OOS AUC : {valid_oos.mean():.3f}  (越高越好，0.5=跟猜相同)")
+        print(f"平均 OOS AUC : {valid_oos.mean():.3f}")
         gap = (oos_df["train_auc"] - oos_df["oos_auc"]).dropna()
         if len(gap):
-            print(f"訓練/OOS AUC gap : {gap.mean():.3f}  (越小越不易過擬合)")
+            print(f"訓練/OOS gap  : {gap.mean():.3f}")
     print("\n各期 OOS 細節:")
     print(oos_df[["period","train_auc","oos_auc","nav","selected"]].to_string(index=False))
     try:
@@ -269,7 +270,6 @@ def plot_results(nav_df, oos_df):
                      where=(vals >= 100), alpha=0.15, color="green")
     ax1.fill_between(range(len(vals)), 100, vals,
                      where=(vals < 100), alpha=0.15, color="red")
-
     x = range(len(oos_df))
     ax2.bar([i-0.2 for i in x], oos_df["train_auc"].fillna(0), width=0.4,
             label="訓練 AUC", color="steelblue", alpha=0.8)
@@ -298,12 +298,13 @@ if __name__ == "__main__":
     history_df["stock_id"] = history_df["stock_id"].astype(str)
     print(f"載入 {len(history_df)} 筆持股資料，{history_df['period'].nunique()} 個時期")
 
-    # 展示 NaN 統計
     feat_cols = get_feature_cols(history_df)
     nan_rates = history_df[feat_cols].isna().mean()
-    print("\nNaN 比例:")
-    for col, rate in nan_rates[nan_rates > 0].items():
-        print(f"  {col}: {rate*100:.1f}%")
+    hi_nan = nan_rates[nan_rates > 0.05]
+    if len(hi_nan):
+        print("NaN 比例:")
+        for col, r in hi_nan.items():
+            print(f"  {col}: {r*100:.1f}%")
 
     universe = history_df["stock_id"].unique().tolist()
     print("\n下載歷史股價...")
