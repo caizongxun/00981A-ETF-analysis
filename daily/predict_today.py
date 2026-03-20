@@ -27,10 +27,7 @@ FEAT_JSON  = MODEL_DIR / "daily_feature_cols.json"
 OUT_TODAY  = DATA_DIR / "anomaly_today.csv"
 OUT_LOG    = DATA_DIR / "anomaly_log.csv"
 
-TOP_N            = 20
-UP_PROB_THRESH   = 0.45   # 模型 recall 偏低，閨値放对
-
-DOWN_PROB_THRESH = 0.45
+TOP_N = 20
 
 
 def load_models():
@@ -40,8 +37,20 @@ def load_models():
             sys.exit(1)
     with open(UP_MODEL,   "rb") as f: up_m   = pickle.load(f)
     with open(DOWN_MODEL, "rb") as f: down_m = pickle.load(f)
-    with open(FEAT_JSON)         as f: feats  = json.load(f)
-    return up_m, down_m, feats
+    with open(FEAT_JSON)        as f: meta   = json.load(f)
+
+    # 相容新版 (dict) 與舊版 (list) FEAT_JSON
+    if isinstance(meta, dict):
+        feat_cols   = meta["feature_cols"]
+        up_thresh   = meta.get("up_thresh",   0.45)
+        down_thresh = meta.get("down_thresh", 0.45)
+    else:
+        feat_cols   = meta
+        up_thresh   = 0.45
+        down_thresh = 0.45
+
+    print(f"特徵數: {len(feat_cols)}  up_thresh={up_thresh:.2f}  down_thresh={down_thresh:.2f}")
+    return up_m, down_m, feat_cols, up_thresh, down_thresh
 
 
 def _squeeze(s):
@@ -52,23 +61,17 @@ def _squeeze(s):
 
 
 def fetch_recent_ohlcv(sym: str, lookback: int = 45) -> pd.DataFrame:
-    """拉最近 lookback 天的 OHLCV，稩容 yfinance MultiIndex"""
     h = yf.download(sym, period=f"{lookback}d", progress=False, auto_adjust=True)
     if h.empty:
         return pd.DataFrame()
-
-    # 統一處理 MultiIndex columns (yfinance >= 0.2.x)
     if isinstance(h.columns, pd.MultiIndex):
         h.columns = h.columns.get_level_values(0)
-
     close  = _squeeze(h.get("Close",  h.iloc[:, 0]))
     volume = _squeeze(h.get("Volume", pd.Series(np.nan, index=h.index)))
     high   = _squeeze(h.get("High",   close))
     low    = _squeeze(h.get("Low",    close))
-
     close.index = pd.to_datetime(close.index).tz_localize(None)
     idx = close.index
-
     return pd.DataFrame({
         "date":   idx,
         "close":  close.values,
@@ -87,11 +90,11 @@ def compute_today_features(g: pd.DataFrame, inst_today: float = np.nan,
     h  = g["high"].astype(float).reset_index(drop=True)
     lo = g["low"].astype(float).reset_index(drop=True)
 
-    ma5_v  = v.rolling(5,  min_periods=3).mean().iloc[-1]
-    ma20_v = v.rolling(20, min_periods=10).mean().iloc[-1]
+    ma5_v   = v.rolling(5,  min_periods=3).mean().iloc[-1]
+    ma20_v  = v.rolling(20, min_periods=10).mean().iloc[-1]
     std20_v = v.rolling(20, min_periods=10).std().iloc[-1]
-    vz20   = (v.iloc[-1] - v.rolling(20, min_periods=10).mean().iloc[-1]) / std20_v \
-             if std20_v and std20_v != 0 else np.nan
+    vz20    = (v.iloc[-1] - v.rolling(20, min_periods=10).mean().iloc[-1]) / std20_v \
+              if std20_v and std20_v != 0 else np.nan
 
     ret1  = float(c.iloc[-1] / c.iloc[-2] - 1) if len(c) >= 2 else np.nan
     ret5  = float(c.iloc[-1] / c.iloc[-6] - 1) if len(c) >= 6 else np.nan
@@ -114,7 +117,7 @@ def compute_today_features(g: pd.DataFrame, inst_today: float = np.nan,
 
 
 def main():
-    up_m, down_m, feat_cols = load_models()
+    up_m, down_m, feat_cols, up_thresh, down_thresh = load_models()
     client = get_client()
     today  = date.today().strftime("%Y-%m-%d")
     start  = (pd.Timestamp(today) - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
@@ -134,7 +137,6 @@ def main():
         if g.empty or len(g) < 21:
             continue
 
-        # 三大法人今日
         inst_today = np.nan
         try:
             inst_rows = client.get("TaiwanStockInstitutionalInvestorsBuySell", tk, start)
@@ -150,7 +152,6 @@ def main():
         except Exception:
             pass
 
-        # 融資
         margin_chg = np.nan
         try:
             m_rows = client.get("TaiwanStockMarginPurchaseShortSale", tk, start)
@@ -167,7 +168,8 @@ def main():
         if feat is None:
             continue
 
-        X = np.array([[feat.get(c, np.nan) for c in feat_cols]], dtype=np.float32)
+        # 用 DataFrame 傳入，避免 sklearn feature name warning
+        X = pd.DataFrame([[feat.get(c, np.nan) for c in feat_cols]], columns=feat_cols)
         up_prob   = float(up_m.predict_proba(X)[0, 1])
         down_prob = float(down_m.predict_proba(X)[0, 1])
 
@@ -192,18 +194,17 @@ def main():
     result.sort_values("up_prob", ascending=False, inplace=True)
     result.to_csv(OUT_TODAY, index=False, encoding="utf-8-sig")
 
-    print(f"\n=== 今日異常上漲候選 (top {TOP_N}, 間値>{UP_PROB_THRESH}) ===")
-    up_cands = result[result["up_prob"] > UP_PROB_THRESH]
-    show_cols = [c for c in ["stock_id","up_prob","vol_ratio_20d","inst_net_ratio","close"] if c in result.columns]
-    print(up_cands[show_cols].head(TOP_N).to_string(index=False))
+    print(f"\n=== 今日異常上漲候選 (top {TOP_N}, 閾值>{up_thresh:.2f}) ===")
+    up_cands  = result[result["up_prob"] > up_thresh]
+    show_up   = [c for c in ["stock_id","up_prob","vol_ratio_20d","inst_net_ratio","close"] if c in result.columns]
+    print(up_cands[show_up].head(TOP_N).to_string(index=False))
 
-    print(f"\n=== 今日異常下跌候選 (top {TOP_N}, 間値>{DOWN_PROB_THRESH}) ===")
+    print(f"\n=== 今日異常下跌候選 (top {TOP_N}, 閾值>{down_thresh:.2f}) ===")
     down_cands = result.sort_values("down_prob", ascending=False)
-    down_cands = down_cands[down_cands["down_prob"] > DOWN_PROB_THRESH]
-    show_cols2 = [c for c in ["stock_id","down_prob","vol_ratio_20d","close"] if c in result.columns]
-    print(down_cands[show_cols2].head(TOP_N).to_string(index=False))
+    down_cands = down_cands[down_cands["down_prob"] > down_thresh]
+    show_down  = [c for c in ["stock_id","down_prob","vol_ratio_20d","close"] if c in result.columns]
+    print(down_cands[show_down].head(TOP_N).to_string(index=False))
 
-    # 累積 log
     if OUT_LOG.exists():
         log = pd.concat([pd.read_csv(OUT_LOG), result], ignore_index=True)
     else:
