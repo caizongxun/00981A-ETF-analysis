@@ -19,7 +19,6 @@ setup_font()
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 
-# 包含所有可用特徵，載入時自動與 CSV 欄交集
 FEATURE_COLS_ALL = [
     "mom_1m", "mom_3m", "mom_6m",
     "vol_20d", "vol_60d",
@@ -54,18 +53,32 @@ def get_valid_symbol(stock_id: str):
 
 
 def get_feature_cols(df: pd.DataFrame) -> list:
-    """\u53d6 CSV \u5167\u5be6\u969b\u5b58\u5728\u7684\u7279\u5fb5\u6b04"""
     return [c for c in FEATURE_COLS_ALL if c in df.columns]
 
 
+def impute(df: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
+    """NaN 用訓練集中位數填漟，避免營收特徵無資料時訓練資料被大量排除"""
+    df = df.copy()
+    for col in feature_cols:
+        if col in df.columns:
+            med = df[col].median()
+            df[col] = df[col].fillna(med if not np.isnan(med) else 0)
+    return df
+
+
 def train_model(train_df, feature_cols):
-    df = train_df.dropna(subset=feature_cols)
-    if len(df) < 10 or df["in_etf"].nunique() < 2:
+    df = impute(train_df, feature_cols)
+    # 要求兩類別各至少 5 筆
+    if df["in_etf"].nunique() < 2:
+        return None, None, np.nan
+    if df["in_etf"].value_counts().min() < 5:
         return None, None, np.nan
     X = df[feature_cols].values
     y = df["in_etf"].values
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
+    # 儲存訓練集中位數，預測時使用
+    scaler.impute_medians_ = {col: train_df[col].median() for col in feature_cols}
     rf = RandomForestClassifier(
         n_estimators=300, max_depth=5,
         class_weight="balanced", random_state=42
@@ -79,12 +92,18 @@ def train_model(train_df, feature_cols):
 
 
 def predict_top(model, scaler, feat_df, feature_cols):
-    df = feat_df.dropna(subset=feature_cols).copy()
+    df = feat_df.copy()
+    # 用訓練集中位數填漟
+    for col in feature_cols:
+        med = getattr(scaler, "impute_medians_", {}).get(col, 0)
+        df[col] = df[col].fillna(med if not np.isnan(float(med)) else 0)
+    df = df.dropna(subset=feature_cols)
     if df.empty or model is None:
         return []
     proba = model.predict_proba(scaler.transform(df[feature_cols].values))
     if proba.shape[1] < 2:
         return []
+    df = df.copy()
     df["prob"] = proba[:, 1]
     df = df[df["prob"] >= THRESHOLD]
     return [str(t) for t in df.nlargest(TOP_N, "prob")["stock_id"].tolist()]
@@ -141,7 +160,9 @@ def run_walk_forward(history_df, price_df):
         curr_feat = history_df[history_df["period"] == train_up_to].copy()
         selected  = predict_top(model, scaler, curr_feat, feature_cols)
 
-        actual_df = history_df[history_df["period"] == predict_for].dropna(subset=feature_cols)
+        # OOS AUC
+        actual_df = history_df[history_df["period"] == predict_for].copy()
+        actual_df = impute(actual_df, feature_cols)
         oos_auc = np.nan
         if not actual_df.empty and actual_df["in_etf"].nunique() >= 2:
             try:
@@ -179,7 +200,7 @@ def run_walk_forward(history_df, price_df):
         nav = cash + sum(sh * float(price_row.get(tk, 0)) for tk, sh in holdings.items())
         nav_log.append({"period": predict_for, "nav": nav})
         oos_list.append({
-            "period": predict_for,
+            "period":    predict_for,
             "train_auc": round(float(train_auc), 4) if not np.isnan(train_auc) else np.nan,
             "oos_auc":   round(float(oos_auc),   4) if not np.isnan(oos_auc)   else np.nan,
             "selected":  ",".join(selected),
@@ -198,6 +219,9 @@ def run_walk_forward(history_df, price_df):
 
 
 def print_performance(nav_df, oos_df):
+    if nav_df.empty:
+        print("[ERROR] 沒有任何有效期數可以展示")
+        return
     total  = nav_df["nav"].iloc[-1] / INITIAL_CASH - 1
     annual = (1 + total) ** (12 / max(len(nav_df), 1)) - 1
     ret    = nav_df["nav"].pct_change().dropna()
@@ -210,17 +234,17 @@ def print_performance(nav_df, oos_df):
     print(f"最大回撤     : {max_dd*100:.2f}%")
     valid_oos = oos_df["oos_auc"].dropna()
     if len(valid_oos):
-        print(f"平均 OOS AUC : {valid_oos.mean():.3f}")
+        print(f"平均 OOS AUC : {valid_oos.mean():.3f}  (越高越好，0.5=跟猜相同)")
         gap = (oos_df["train_auc"] - oos_df["oos_auc"]).dropna()
         if len(gap):
-            print(f"訓練/OOS gap  : {gap.mean():.3f}")
+            print(f"訓練/OOS AUC gap : {gap.mean():.3f}  (越小越不易過擬合)")
     print("\n各期 OOS 細節:")
     print(oos_df[["period","train_auc","oos_auc","nav","selected"]].to_string(index=False))
     try:
         bm  = yf.download("0050.TW", start="2025-06-01", end=END_DATE,
                           progress=False, auto_adjust=True)["Close"]
-        bm0 = float(bm.iloc[0].iloc[0] if hasattr(bm.iloc[0], 'iloc') else bm.iloc[0])
-        bm1 = float(bm.iloc[-1].iloc[0] if hasattr(bm.iloc[-1], 'iloc') else bm.iloc[-1])
+        bm0 = float(bm.iloc[0].iloc[0] if hasattr(bm.iloc[0], "iloc") else bm.iloc[0])
+        bm1 = float(bm.iloc[-1].iloc[0] if hasattr(bm.iloc[-1], "iloc") else bm.iloc[-1])
         bm_ret = (bm1 / bm0 - 1) * 100
         print(f"\n大盤(0050)報酬 : {bm_ret:.2f}%")
         print(f"Alpha        : {total*100 - bm_ret:.2f}%")
@@ -229,6 +253,8 @@ def print_performance(nav_df, oos_df):
 
 
 def plot_results(nav_df, oos_df):
+    if nav_df.empty:
+        return
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 9))
     nav_norm = nav_df["nav"] / INITIAL_CASH * 100
     ax1.plot(range(len(nav_norm)), nav_norm.values, marker="o",
@@ -271,6 +297,13 @@ if __name__ == "__main__":
     history_df = pd.read_csv(hist_path)
     history_df["stock_id"] = history_df["stock_id"].astype(str)
     print(f"載入 {len(history_df)} 筆持股資料，{history_df['period'].nunique()} 個時期")
+
+    # 展示 NaN 統計
+    feat_cols = get_feature_cols(history_df)
+    nan_rates = history_df[feat_cols].isna().mean()
+    print("\nNaN 比例:")
+    for col, rate in nan_rates[nan_rates > 0].items():
+        print(f"  {col}: {rate*100:.1f}%")
 
     universe = history_df["stock_id"].unique().tolist()
     print("\n下載歷史股價...")
