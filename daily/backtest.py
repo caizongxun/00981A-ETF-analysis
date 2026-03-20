@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-日頻模型回測系統 - Walk-Forward Out-of-Sample v3
+日頻模型回測系統 - Walk-Forward Out-of-Sample v4
 
 選股逻輯:
-  1. 用 up_prob 主排序
-  2. score = up_prob - down_prob > 0 才納入候選（上漲機率必須 > 下跌機率）
-  3. 不再做 fold-level ATR 過濾，避免左右賭後尺
+  1. score > 0 過濾 (up_prob > down_prob)
+  2. up_prob 排序，選 top N
+  3. 支援多日持有 HOLD_DAYS (1/3/5)
 
 執行: python daily/backtest.py
 """
@@ -32,6 +32,7 @@ TOP_N            = 5
 STOP_LOSS        = -0.03
 UP_CAP           =  0.097
 COST_RT          = 0.001425
+HOLD_DAYS        = 3    # 持有天數: 1=当日出場, 3=續抜3天, 5=續抜5天
 
 
 def load_feat_cols():
@@ -49,7 +50,7 @@ def fetch_0050_returns(start: str, end: str) -> pd.Series:
                     end=(pd.Timestamp(end) + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
                     progress=False, auto_adjust=True)
     if h.empty:
-        print("失敗，將使用 0 作為基準")
+        print("失敗")
         return pd.Series(dtype=float)
     close = h["Close"]
     if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
@@ -59,7 +60,7 @@ def fetch_0050_returns(start: str, end: str) -> pd.Series:
     return ret
 
 
-def train_fold(X_tr: pd.DataFrame, y_up: np.ndarray, y_dn: np.ndarray):
+def train_fold(X_tr, y_up, y_dn):
     try:
         import lightgbm as lgb
     except ImportError:
@@ -81,15 +82,35 @@ def train_fold(X_tr: pd.DataFrame, y_up: np.ndarray, y_dn: np.ndarray):
     return _fit(y_up), _fit(y_dn)
 
 
-def summarize(trades_df, equity_df, n_folds, top_n):
+def compute_hold_ret(date_idx: dict, dates: list, start_dt, hold_days: int,
+                     df: pd.DataFrame) -> dict:
+    """
+    預先計算每支股票從入場日起持有 hold_days 天的累積報酬。
+    回傳 {stock_id: hold_ret}
+    """
+    # 找出出場日 index
+    si = date_idx.get(start_dt)
+    if si is None: return {}
+    exit_i = min(si + hold_days, len(dates) - 1)
+    exit_dt = dates[exit_i]
+
+    # 從 start_dt 到 exit_dt 所有日子準將 fwd_ret_1d 展開再複利
+    window = df[(df["date"] > start_dt) & (df["date"] <= exit_dt)]
+    result = {}
+    for sid, g in window.groupby("stock_id"):
+        cum = float((1 + g["fwd_ret_1d"]).prod() - 1)
+        result[sid] = cum
+    return result
+
+
+def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
     n_trades  = len(trades_df)
     win_rate  = (trades_df["adj_ret"] > 0).mean() * 100
     avg_ret   = trades_df["adj_ret"].mean() * 100
     total_ret = equity_df["cum_ret"].iloc[-1] * 100
     bm_ret_t  = equity_df["bm_cum_ret"].iloc[-1] * 100
     excess    = total_ret - bm_ret_t
-    stop_n    = trades_df["stopped"].sum()
-    capped_n  = trades_df["capped"].sum()
+    stop_n    = (trades_df["raw_ret"] <= STOP_LOSS * hold_days).sum()
 
     eq       = equity_df["cum_ret"].values + 1
     roll_max = np.maximum.accumulate(eq)
@@ -109,14 +130,11 @@ def summarize(trades_df, equity_df, n_folds, top_n):
     print("\n" + "="*55)
     print("Walk-Forward OOS 回測結果  (基準: 0050)")
     print(f"回測期間: {bt_s} ~ {bt_e}  Folds: {n_folds}")
-    print(f"選股數: top {top_n}  停損: {STOP_LOSS*100:.0f}%  上限: {UP_CAP*100:.1f}%  每邊成本: {COST_RT*100:.4f}%")
-    print(f"選股邏輯: up_prob 排序 + score>0 過濾")
+    print(f"選股數: top {top_n}  持有: {hold_days}天  停損: {STOP_LOSS*100:.0f}%  每邊成本: {COST_RT*100:.4f}%")
     print("="*55)
     print(f"總交易筆數    : {n_trades}")
     print(f"勝率         : {win_rate:.1f}%")
     print(f"平均單筆報酬  : {avg_ret:+.3f}%")
-    print(f"單日停損筆數  : {stop_n}  ({stop_n/n_trades*100:.1f}%)")
-    print(f"單日觸上限筆數: {capped_n}  ({capped_n/n_trades*100:.1f}%)")
     print(f"策略總報酬    : {total_ret:+.2f}%")
     print(f"策略年化報酬  : {ann_ret:+.2f}%")
     print(f"0050 總報酬    : {bm_ret_t:+.2f}%")
@@ -149,6 +167,7 @@ def run_backtest():
         print("[ERROR] 請先執行 python daily/build_features.py")
         sys.exit(1)
 
+    # clip 單日報酬 (多日持有用於計算累積，不再 clip hold_days)
     df["fwd_ret_1d"] = df["fwd_ret_1d"].clip(STOP_LOSS, UP_CAP)
 
     avail = [c for c in feat_cols if c in df.columns]
@@ -157,7 +176,9 @@ def run_backtest():
 
     all_dates  = sorted(df["date"].unique())
     total_days = len(all_dates)
+    date_idx   = {d: i for i, d in enumerate(all_dates)}
     print(f"資料範圍: {all_dates[0].date()} ~ {all_dates[-1].date()} ({total_days} 交易日)")
+    print(f"持有天數: {HOLD_DAYS} 天")
 
     min_train_days = MIN_TRAIN_MONTHS * 21
     bt_dates  = all_dates[min_train_days:]
@@ -196,7 +217,14 @@ def run_backtest():
         )
         print(f"完成  (訓練 {len(X_tr):,} 筆 | 測試 {len(test_df):,} 筆)")
 
-        for dt in sorted(test_df["date"].unique()):
+        test_dates = sorted(test_df["date"].unique())
+
+        # HOLD_DAYS=1: 與舊版相同，用 fwd_ret_1d
+        # HOLD_DAYS>1: 每天基於 signal 日選出股票，累積後續 hold_days 天的報酬
+        # 等重: 每天選新的組，不重離
+        skip_until = {}  # stock_id -> 封鎖到的 date index
+
+        for dt_i, dt in enumerate(test_dates):
             day_df = test_df[test_df["date"] == dt].dropna(subset=avail).copy()
             if len(day_df) < TOP_N:
                 continue
@@ -206,21 +234,43 @@ def run_backtest():
             day_df["dn_prob"] = dn_model.predict_proba(X_day)[:, 1]
             day_df["score"]   = day_df["up_prob"] - day_df["dn_prob"]
 
-            # score > 0: up_prob 必須 > down_prob 才入候選
             candidates = day_df[day_df["score"] > 0]
             if len(candidates) < TOP_N:
-                candidates = day_df  # 候選不足時 fallback 到全部
+                candidates = day_df
 
-            picks    = candidates.nlargest(TOP_N, "up_prob")
-            raw_rets = picks["fwd_ret_1d"].values
+            picks = candidates.nlargest(TOP_N, "up_prob")
+
+            if HOLD_DAYS == 1:
+                raw_rets = picks["fwd_ret_1d"].values
+            else:
+                # 累積 hold_days 天的報酬
+                raw_rets = []
+                for _, row in picks.iterrows():
+                    sid = row["stock_id"]
+                    si  = date_idx.get(dt)
+                    if si is None: raw_rets.append(np.nan); continue
+                    exit_i   = min(si + HOLD_DAYS, len(all_dates) - 1)
+                    hold_df  = df[(df["stock_id"] == sid) &
+                                  (df["date"] > dt) &
+                                  (df["date"] <= all_dates[exit_i])]
+                    if hold_df.empty: raw_rets.append(np.nan); continue
+                    cum = float((1 + hold_df["fwd_ret_1d"]).prod() - 1)
+                    raw_rets.append(cum)
+                raw_rets = np.array(raw_rets)
+
+            raw_rets = raw_rets[~np.isnan(raw_rets)]
+            if len(raw_rets) == 0: continue
             adj_rets = raw_rets - COST_RT * 2
             port_ret = float(np.mean(adj_rets))
 
-            bm_candidates = bm_ret_series[
-                (bm_ret_series.index >= dt) &
-                (bm_ret_series.index <= dt + pd.Timedelta(days=5))
-            ]
-            bm_ret = float(bm_candidates.iloc[0]) if len(bm_candidates) > 0 else 0.0
+            # 基準: 0050 持有同樣天數累積
+            si = date_idx.get(dt)
+            exit_i = min(si + HOLD_DAYS, len(all_dates) - 1) if si is not None else si
+            bm_window = bm_ret_series[
+                (bm_ret_series.index > dt) &
+                (bm_ret_series.index <= all_dates[exit_i])
+            ] if exit_i is not None else pd.Series(dtype=float)
+            bm_ret = float((1 + bm_window).prod() - 1) if len(bm_window) > 0 else 0.0
 
             cum_ret += np.log1p(port_ret)
             bm_cum  += np.log1p(bm_ret)
@@ -234,8 +284,9 @@ def run_backtest():
                 "bm_cum_ret": round(float(np.expm1(bm_cum)),  6),
             })
 
-            for _, row in picks.iterrows():
-                r     = float(row["fwd_ret_1d"])
+            for j, (_, row) in enumerate(picks.iterrows()):
+                r     = float(raw_rets[j]) if j < len(raw_rets) else np.nan
+                if np.isnan(r): continue
                 r_adj = r - COST_RT * 2
                 all_trades.append({
                     "fold":        fold_i + 1,
@@ -248,7 +299,7 @@ def run_backtest():
                     "raw_ret":     round(r,     6),
                     "adj_ret":     round(r_adj, 6),
                     "stopped":     int(r <= STOP_LOSS),
-                    "capped":      int(r >= UP_CAP),
+                    "capped":      int(r >= UP_CAP * HOLD_DAYS),
                 })
 
     trades_df = pd.DataFrame(all_trades)
@@ -257,7 +308,7 @@ def run_backtest():
     trades_df.to_csv(OUT_TRADES, index=False, encoding="utf-8-sig")
     equity_df.to_csv(OUT_EQUITY, index=False, encoding="utf-8-sig")
 
-    summarize(trades_df, equity_df, N_FOLDS, TOP_N)
+    summarize(trades_df, equity_df, N_FOLDS, TOP_N, HOLD_DAYS)
     print(f"\n輸出: {OUT_TRADES}")
     print(f"輸出: {OUT_EQUITY}")
     return equity_df, trades_df
