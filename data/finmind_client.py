@@ -5,7 +5,6 @@ FinMind API client 含 token 輪轉功能
 設定方式：將所有 token 寫入 .finmind_tokens，一行一個：
   eyJhbGci...(token1)
   eyJhbGci...(token2)
-  eyJhbGci...(token3)
 
 沒有 .finmind_tokens 時自動 fallback 到 .finmind_token (單一 token)
 """
@@ -21,7 +20,6 @@ _TOKEN_FILE  = ROOT / ".finmind_token"
 
 
 def _load_tokens() -> list[str]:
-    """載入所有可用的 token"""
     if _TOKENS_FILE.exists():
         tokens = [
             line.strip() for line in _TOKENS_FILE.read_text(encoding="utf-8").splitlines()
@@ -36,32 +34,25 @@ def _load_tokens() -> list[str]:
     env_token = os.environ.get("FINMIND_TOKEN", "")
     if env_token:
         return [env_token]
-    return [""]  # 未登入模式
+    return [""]
 
 
 class FinMindClient:
-    """
-    FinMind API client with token rotation.
-    被限流時自動切換到下一個 token。
-    """
     FINMIND_API = "https://api.finmindtrade.com/api/v4/data"
-    # 回傳這些錯誤碼時認為需要换 token
-    RATE_LIMIT_CODES = {401, 403, 429}
+    # 402 = 超出每日额度，和 401/403/429 一樣認為需要換 token 或放棄
+    RATE_LIMIT_CODES = {401, 402, 403, 429}
 
     def __init__(self):
         self._tokens = _load_tokens()
         self._idx    = 0
         self._lock   = Lock()
-        self._cooldown: dict[int, float] = {}  # idx -> 失效時間 (epoch)
+        self._cooldown: dict[int, float] = {}
         print(f"[FinMind] 載入 {len(self._tokens)} 個 token" +
               (" (token 輪轉已啟用)" if len(self._tokens) > 1 else ""))
 
-    def _next_token(self, failed_idx: int):
-        """failed_idx 這個 token 失敗，切換到下一個"""
+    def _next_token(self, failed_idx: int) -> bool:
         with self._lock:
-            # 把失敗的 token 冷卻 1 小時
             self._cooldown[failed_idx] = time.time() + 3600
-            # 尋找下一個可用的
             now = time.time()
             for i in range(len(self._tokens)):
                 idx = (failed_idx + 1 + i) % len(self._tokens)
@@ -69,18 +60,13 @@ class FinMindClient:
                     self._idx = idx
                     print(f"[FinMind] 切換到 token [{idx+1}/{len(self._tokens)}]")
                     return True
-            print("[FinMind] 所有 token 都已被限流，等待 60s...")
-            time.sleep(60)
-            # 重置冷卻記錄，再試一次
-            self._cooldown.clear()
+            # 所有 token 都超限，直接放棄
+            print("[FinMind] 所有 token 超限，放棄此筆資料")
             return False
 
     def get(self, dataset: str, data_id: str, start_date: str,
             retries: int = 3) -> list[dict]:
-        """
-        拉取 FinMind 資料，被限流時自動换 token 重試
-        """
-        for attempt in range(retries * len(self._tokens)):
+        for attempt in range(retries * max(len(self._tokens), 1)):
             with self._lock:
                 idx   = self._idx
                 token = self._tokens[idx]
@@ -95,21 +81,25 @@ class FinMindClient:
                     },
                     timeout=20,
                 )
+                # HTTP 層面的超限處理（包含 402）
                 if r.status_code in self.RATE_LIMIT_CODES:
-                    print(f"[FinMind] token[{idx+1}] 被限流 (HTTP {r.status_code})")
-                    self._next_token(idx)
+                    print(f"[FinMind] token[{idx+1}] 超限 HTTP {r.status_code}")
+                    ok = self._next_token(idx)
+                    if not ok:
+                        return []   # 所有 token 都超限，直接回空
                     continue
                 r.raise_for_status()
                 data = r.json()
-                # FinMind 用 status=402 表示超限
+                # JSON 層面的超限處理
                 if data.get("status") in (402, 403):
-                    print(f"[FinMind] token[{idx+1}] 超出额度: {data.get('msg','')}")
-                    self._next_token(idx)
+                    print(f"[FinMind] token[{idx+1}] 超出額度: {data.get('msg','')}")
+                    ok = self._next_token(idx)
+                    if not ok:
+                        return []
                     continue
                 if data.get("status") == 200:
                     return data.get("data", [])
-                # 其他錯誤
-                print(f"[FinMind] 小異常 status={data.get('status')} msg={data.get('msg','')}")
+                print(f"[FinMind] 異常 status={data.get('status')} msg={data.get('msg','')}")
                 return []
             except requests.RequestException as e:
                 print(f"[FinMind] 網路錯誤: {e}，等待 5s")
@@ -117,7 +107,6 @@ class FinMindClient:
         return []
 
 
-# 全域 singleton
 _client: FinMindClient | None = None
 
 
