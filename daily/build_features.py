@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-日頻特徵建構 - T+0 架構 v4
+日頻特徵建構 - T+0 架構 v5
 
 輸入:  data/daily_raw.csv
 輸出:  data/daily_features.csv
 
-特徵清單 (22 個, 全部 T-1 收盤後已知):
+特徵清單 (25 個, 全部 T-1 收盤後已知):
   量能類: vol_ratio_5d, vol_ratio_20d, vol_zscore_20d, obv_slope
   報酬動能: ret_1d, ret_5d, ret_20d, mom_acc
   價格結構: high_low_pct, close_vs_ma5, close_vs_ma20, close_vs_ma60,
@@ -13,11 +13,14 @@
   技術指標: rsi_14
   法人融資: inst_net_ratio, inst_net_ratio_5d, margin_chg_pct, short_ratio
   成交金額: turnover_ratio
-標籤: label_up1 (T+1 報酬 > 2%), label_down1 (T+1 報酬 < -2%)
+  大盤狀態: mkt_ret_5d, mkt_ret_20d, mkt_above_ma60  <-- NEW v5
+標籤: label_up1  (T+1~T+3 累計報酬 > 2%)
+      label_down1 (T+1~T+3 累計報酬 < -2%)
 """
 from pathlib import Path
 import pandas as pd
 import numpy as np
+import yfinance as yf
 
 ROOT     = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -26,6 +29,7 @@ OUT_CSV  = DATA_DIR / "daily_features.csv"
 
 UP_THRESH   =  0.02
 DOWN_THRESH = -0.02
+FWD_DAYS    =  3   # 對齊 HOLD_DAYS=3
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -34,6 +38,39 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     loss  = (-delta.clip(upper=0)).rolling(period, min_periods=period).mean()
     rs    = gain / loss.replace(0, np.nan)
     return 100 - 100 / (1 + rs)
+
+
+def fetch_market_features(start_date, end_date) -> pd.DataFrame:
+    """下載 0050 作為大盤特徵，回傳以 date 為 index 的 DataFrame"""
+    print("下載 0050 大盤特徵...", end=" ", flush=True)
+    try:
+        h = yf.download(
+            "0050.TW",
+            start=(pd.Timestamp(start_date) - pd.Timedelta(days=90)).strftime("%Y-%m-%d"),
+            end=(pd.Timestamp(end_date) + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+            progress=False, auto_adjust=True,
+        )
+        if h.empty:
+            print("失敗，大盤特徵設為 NaN")
+            return pd.DataFrame()
+        close = h["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close.index = pd.to_datetime(close.index).tz_localize(None)
+        close = close.sort_index()
+        ma60  = close.rolling(60, min_periods=30).mean()
+        mdf = pd.DataFrame({
+            "date":           close.index,
+            "mkt_ret_5d":     close.pct_change(5).values,
+            "mkt_ret_20d":    close.pct_change(20).values,
+            "mkt_above_ma60": (close >= ma60).astype(float).values,
+        })
+        mdf = mdf.dropna(subset=["mkt_ret_5d"])
+        print(f"OK ({len(mdf)} 天)")
+        return mdf.set_index("date")
+    except Exception as e:
+        print(f"失敗 ({e})，大盤特徵設為 NaN")
+        return pd.DataFrame()
 
 
 def build(df: pd.DataFrame) -> pd.DataFrame:
@@ -46,6 +83,10 @@ def build(df: pd.DataFrame) -> pd.DataFrame:
             "daily_raw.csv 缺少 adj_close 欄位，"
             "請重新執行 python daily/fetch_daily.py"
         )
+
+    # 大盤特徵 (shift 1 天，確保 T-1 已知)
+    mkt_df = fetch_market_features(df["date"].min(), df["date"].max())
+    has_mkt = not mkt_df.empty
 
     records = []
     for sid, g in df.groupby("stock_id"):
@@ -116,6 +157,11 @@ def build(df: pd.DataFrame) -> pd.DataFrame:
         turnover_ma20  = turnover.rolling(20, min_periods=10).mean()
         turnover_ratio = turnover_ma5 / turnover_ma20.replace(0, np.nan)
 
+        # --- label: 3 天累積報酬 (對齊 HOLD_DAYS=3) ---
+        fwd3 = (1 + c.pct_change(1).shift(-1)) * \
+               (1 + c.pct_change(1).shift(-2)) * \
+               (1 + c.pct_change(1).shift(-3)) - 1
+        # 保留 fwd_ret_1d 供相容性
         fwd1 = c.shift(-1) / c - 1
 
         def s(x): return x.shift(1).values
@@ -145,20 +191,34 @@ def build(df: pd.DataFrame) -> pd.DataFrame:
             "short_ratio":       s(short_ratio),
             "turnover_ratio":    s(turnover_ratio),
             "fwd_ret_1d":        fwd1.values,
-            "label_up1":         (fwd1 > UP_THRESH).astype(int).values,
-            "label_down1":       (fwd1 < DOWN_THRESH).astype(int).values,
+            "fwd_ret_3d":        fwd3.values,
+            "label_up1":         (fwd3 > UP_THRESH).astype(int).values,
+            "label_down1":       (fwd3 < DOWN_THRESH).astype(int).values,
         })
         records.append(feat)
 
     out = pd.concat(records, ignore_index=True)
-    out.dropna(subset=["ret_1d", "vol_ratio_20d", "fwd_ret_1d"], inplace=True)
+    out.dropna(subset=["ret_1d", "vol_ratio_20d", "fwd_ret_3d"], inplace=True)
 
-    p99   = out["fwd_ret_1d"].quantile(0.99)
-    p1    = out["fwd_ret_1d"].quantile(0.01)
-    n_out = ((out["fwd_ret_1d"] > 0.097) | (out["fwd_ret_1d"] < -0.1)).sum()
+    # 合併大盤特徵 (shift 1 天，T-1 已知)
+    if has_mkt:
+        mkt_shifted = mkt_df.shift(1)  # shift on time-index
+        out = out.merge(
+            mkt_shifted.reset_index().rename(columns={"index": "date"}),
+            on="date", how="left",
+        )
+    else:
+        out["mkt_ret_5d"]     = np.nan
+        out["mkt_ret_20d"]    = np.nan
+        out["mkt_above_ma60"] = np.nan
+
+    p99   = out["fwd_ret_3d"].quantile(0.99)
+    p1    = out["fwd_ret_3d"].quantile(0.01)
+    n_out = ((out["fwd_ret_3d"] > 0.15) | (out["fwd_ret_3d"] < -0.15)).sum()
     nan_rate = out.drop(columns=["date","stock_id","close",
-                                  "fwd_ret_1d","label_up1","label_down1"]).isna().mean()
-    print(f"fwd_ret_1d p1={p1*100:.2f}%  p99={p99*100:.2f}%  "
+                                  "fwd_ret_1d","fwd_ret_3d",
+                                  "label_up1","label_down1"]).isna().mean()
+    print(f"fwd_ret_3d p1={p1*100:.2f}%  p99={p99*100:.2f}%  "
           f"超上下限筆數: {n_out} ({n_out/len(out)*100:.1f}%)")
     high_nan = nan_rate[nan_rate > 0.3]
     if len(high_nan):

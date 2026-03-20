@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-日頻模型回測系統 - Walk-Forward Out-of-Sample v7.1
+日頻模型回測系統 - Walk-Forward Out-of-Sample v8
 
-穩定版本 (基於 v7):
-  - 滑價 SLIPPAGE_RT=0.3%
-  - 流動性失敗 LIQUIDITY_FAIL=5%
-  - 起始資金 INIT_CAPITAL=10,000 NTD
-  - MIN_SCORE=0.10 過濾低信心選股
-  - 不設停損，用總報酬 clip(STOP_LOSS, UP_CAP) 控制極端値
+變更 (vs v7.1):
+  - 使用 fwd_ret_3d 作為持倉報酬 (對齊 HOLD_DAYS=3)
+  - 加市場狀態過濾: 0050 近 20 日報酬 < 0 時 MIN_SCORE -> MKT_BEAR_SCORE
+  - 大盤特徵 mkt_ret_5d / mkt_ret_20d / mkt_above_ma60 納入選股特徵
 
 執行: python daily/backtest.py
 """
@@ -32,15 +30,18 @@ OUT_EQUITY = DATA_DIR / "backtest_equity.csv"
 N_FOLDS          = 6
 MIN_TRAIN_MONTHS = 12
 TOP_N            = 5
-STOP_LOSS        = -0.03
-UP_CAP           =  0.097
+STOP_LOSS        = -0.10
+UP_CAP           =  0.15
 COST_RT          = 0.001425
 SLIPPAGE_RT      = 0.003
 LIQUIDITY_FAIL   = 0.05
 HOLD_DAYS        = 3
 INIT_CAPITAL     = 10_000
 MIN_SCORE        = 0.10
+MKT_BEAR_SCORE   = 0.30   # 大盤空頭時提高入場門檻
 RANDOM_SEED      = 42
+
+MKT_FEAT_COLS = ["mkt_ret_5d", "mkt_ret_20d", "mkt_above_ma60"]
 
 
 def load_feat_cols():
@@ -66,6 +67,14 @@ def fetch_0050_returns(start: str, end: str) -> pd.Series:
     ret = close.pct_change().dropna()
     print(f"OK ({len(ret)} 天)")
     return ret
+
+
+def is_market_bear(bm_ret_series: pd.Series, dt: pd.Timestamp, window: int = 20) -> bool:
+    """判斷 dt 當天是否為大盤空頭 (近 window 交易日累積報酬 < 0)"""
+    hist = bm_ret_series[bm_ret_series.index < dt].tail(window)
+    if len(hist) < window // 2:
+        return False
+    return float((1 + hist).prod() - 1) < 0
 
 
 def train_fold(X_tr, y_up, y_dn):
@@ -121,7 +130,7 @@ def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
     print("Walk-Forward OOS 回測結果  (基準: 0050)")
     print(f"回測期間: {pd.Timestamp(bt_s).date()} ~ {pd.Timestamp(bt_e).date()}  "
           f"({n_calendar_days}日/{n_years:.2f}年)  Folds: {n_folds}")
-    print(f"選股數: top {top_n}  持有: {hold_days}天  MIN_SCORE: {MIN_SCORE}")
+    print(f"選股數: top {top_n}  持有: {hold_days}天  MIN_SCORE: {MIN_SCORE}  (空頭門檻: {MKT_BEAR_SCORE})")
     print(f"交易成本: {(COST_RT+SLIPPAGE_RT)*100:.4f}%/邊  流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  (共 {liq_fail_n} 筆)")
     print("="*60)
     print(f"起始資金      : {INIT_CAPITAL:,.0f} NTD")
@@ -164,22 +173,35 @@ def run_backtest():
     df.sort_values(["date", "stock_id"], inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    if "fwd_ret_1d" not in df.columns or "label_up1" not in df.columns:
+    # 優先用 fwd_ret_3d，相容舊版
+    use_fwd3 = "fwd_ret_3d" in df.columns
+    fwd_col  = "fwd_ret_3d" if use_fwd3 else "fwd_ret_1d"
+    label_col = "label_up1"
+
+    if fwd_col not in df.columns or label_col not in df.columns:
         print("[ERROR] 請先執行 python daily/build_features.py")
         sys.exit(1)
 
-    df["fwd_ret_1d"] = df["fwd_ret_1d"].clip(STOP_LOSS, UP_CAP)
+    df[fwd_col] = df[fwd_col].clip(STOP_LOSS, UP_CAP)
 
-    avail    = [c for c in feat_cols if c in df.columns]
+    # 加入大盤特徵 (若存在)
+    avail_mkt = [c for c in MKT_FEAT_COLS if c in df.columns]
+    avail     = [c for c in feat_cols if c in df.columns]
+    # 補入大盤特徵 (不重複)
+    for c in avail_mkt:
+        if c not in avail:
+            avail.append(c)
+
     has_down = "label_down1" in df.columns
-    df.dropna(subset=avail + ["label_up1", "fwd_ret_1d"], inplace=True)
+    df.dropna(subset=avail + [label_col, fwd_col], inplace=True)
 
     all_dates  = sorted(df["date"].unique())
     total_days = len(all_dates)
     date_idx   = {d: i for i, d in enumerate(all_dates)}
     print(f"資料範圍: {all_dates[0].date()} ~ {all_dates[-1].date()} ({total_days} 交易日)")
-    print(f"持有天數: {HOLD_DAYS}天  MIN_SCORE: {MIN_SCORE}  滑價: {SLIPPAGE_RT*100:.2f}%")
+    print(f"持有天數: {HOLD_DAYS}天  MIN_SCORE: {MIN_SCORE}  (空頭門檻: {MKT_BEAR_SCORE})  滑價: {SLIPPAGE_RT*100:.2f}%")
     print(f"流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  起始資金: {INIT_CAPITAL:,} NTD")
+    print(f"使用 label: {fwd_col}  大盤特徵: {avail_mkt if avail_mkt else '無'}")
 
     min_train_days = MIN_TRAIN_MONTHS * 21
     bt_dates  = all_dates[min_train_days:]
@@ -215,7 +237,7 @@ def run_backtest():
         X_tr = pd.DataFrame(train_df[avail].values.astype(np.float32), columns=avail)
         up_model, dn_model = train_fold(
             X_tr,
-            train_df["label_up1"].values,
+            train_df[label_col].values,
             train_df["label_down1"].values if has_down else np.zeros(len(train_df), dtype=np.float32),
         )
         print(f"完成  (訓練 {len(X_tr):,} 筆 | 測試 {len(test_df):,} 筆)")
@@ -225,6 +247,11 @@ def run_backtest():
 
         for sig_i in signal_indices:
             dt = test_dates[sig_i]
+
+            # 市場狀態過濾
+            bear = is_market_bear(bm_ret_series, dt, window=20)
+            min_score_today = MKT_BEAR_SCORE if bear else MIN_SCORE
+
             day_df = test_df[test_df["date"] == dt].dropna(subset=avail).copy()
             if len(day_df) < 1:
                 continue
@@ -234,8 +261,11 @@ def run_backtest():
             day_df["dn_prob"] = dn_model.predict_proba(X_day)[:, 1]
             day_df["score"]   = day_df["up_prob"] - day_df["dn_prob"]
 
-            candidates = day_df[day_df["score"] >= MIN_SCORE]
+            candidates = day_df[day_df["score"] >= min_score_today]
             if len(candidates) == 0:
+                # 空頭時若無達標標的則跳過
+                if bear:
+                    continue
                 candidates = day_df[day_df["score"] > 0]
             if len(candidates) == 0:
                 candidates = day_df
@@ -264,9 +294,15 @@ def run_backtest():
                              (df["date"] <= all_dates[exit_i])]
 
                 if hold_df.empty:
-                    raw_rets.append(float(row["fwd_ret_1d"])); liq_flags.append(0); continue
+                    raw_rets.append(float(row[fwd_col])); liq_flags.append(0); continue
 
-                cum = float((1 + hold_df["fwd_ret_1d"]).prod() - 1)
+                if use_fwd3:
+                    # 直接取信號當天的 fwd_ret_3d
+                    cur = df[(df["stock_id"] == sid) & (df["date"] == dt)]
+                    cum = float(cur[fwd_col].values[0]) if len(cur) > 0 \
+                          else float((1 + hold_df["fwd_ret_1d"]).prod() - 1)
+                else:
+                    cum = float((1 + hold_df["fwd_ret_1d"]).prod() - 1)
 
                 if rng.random() < LIQUIDITY_FAIL:
                     carry_over[sid] = cum
@@ -310,6 +346,7 @@ def run_backtest():
                 "cum_ret":    round(float(np.expm1(cum_ret)), 6),
                 "bm_cum_ret": round(float(np.expm1(bm_cum)),  6),
                 "capital":    round(capital, 2),
+                "bear_mode":  int(bear),
             })
 
             valid_idx = np.where(valid)[0]
@@ -328,6 +365,7 @@ def run_backtest():
                     "raw_ret":     round(r,     6),
                     "adj_ret":     round(r_adj, 6),
                     "liq_failed":  int(liq_v[k]),
+                    "bear_mode":   int(bear),
                 })
 
     trades_df = pd.DataFrame(all_trades)
