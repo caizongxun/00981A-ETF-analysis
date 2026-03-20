@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-00981A 全期歷史持股下載 - Point-in-Time 版 v4
+00981A 全期歷史持股下載 - Point-in-Time 版 v5
 
 特徵清單：
   股價類: mom_1m/3m/6m, vol_20d/60d, rs_vs_market, above_ma60, price_range
   成交量類: vol_ratio_20d, log_turnover, price_52w_pct
-  營收類: rev_mom_1m, rev_mom_3m, rev_yoy  (來源: MOPS 公開資訊觀測站)
+  營收類: rev_mom_1m, rev_mom_3m, rev_yoy  (來源: FinMind API)
 
 執行： python data/fetch_history.py
+選填 FinMind token (.呢已註冊免費資料量更大)：
+  https://finmindtrade.com/ 註冊後設定 FINMIND_TOKEN 環境變數，或寫入 .finmind_token
 """
+import os
 import requests
 import pandas as pd
 import numpy as np
@@ -20,15 +23,15 @@ import warnings
 from pathlib import Path
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
-from io import StringIO
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
-COOKIE_FILE = ROOT / ".cookie"
-CACHE_FILE  = DATA_DIR / "period_holdings.json"
-REV_CACHE   = DATA_DIR / "revenue_cache.json"
+COOKIE_FILE  = ROOT / ".cookie"
+CACHE_FILE   = DATA_DIR / "period_holdings.json"
+REV_CACHE    = DATA_DIR / "revenue_cache.json"
+TOKEN_FILE   = ROOT / ".finmind_token"
 
 UNIVERSE_RAW = [
     "2330","2303","2379","2454","3711","2408","3037","2327","2344","2449",
@@ -57,6 +60,15 @@ HEADERS_BASE = {
     "Referer": "https://www.pocket.tw/etf/tw/00981A/fundholding",
 }
 _SUFFIX_CACHE: dict = {}
+
+# ── FinMind token ──
+_FINMIND_TOKEN = (
+    TOKEN_FILE.read_text(encoding="utf-8").strip() if TOKEN_FILE.exists()
+    else os.environ.get("FINMIND_TOKEN", "")
+)
+
+# ── FinMind 營收大表，一次拉全部再查 ──
+_FINMIND_REV_CACHE: dict[str, pd.DataFrame] = {}  # stock_id -> DataFrame
 
 
 def get_valid_symbol(stock_id):
@@ -95,101 +107,80 @@ def fetch_holdings_by_date(query_date, cookie, retries=4, backoff=5.0):
     return set()
 
 
-def fetch_revenue_mops(stock_id: str, year_month: str) -> float | None:
+def fetch_revenue_finmind(stock_id: str) -> pd.DataFrame:
     """
-    從 MOPS 公開資訊觀測站下載月營收 (TWD 千元)
-    使用 POST API: https://mops.twse.com.tw/mops/web/t21sc03
+    從 FinMind 一次拉出該股全部月營收展，回傳 DataFrame(date, revenue)
+    date 格式: YYYY-MM-DD (每月 10 日公布)
     """
-    roc_year = int(year_month[:4]) - 1911
-    month    = int(year_month[5:])
+    if stock_id in _FINMIND_REV_CACHE:
+        return _FINMIND_REV_CACHE[stock_id]
 
-    # 先嘗試上市 (sii)，失敗再試上櫃 (otc)
-    for market in ("sii", "otc"):
-        try:
-            url  = "https://mops.twse.com.tw/mops/web/ajax_t21sc03"
-            data = {
-                "encodeURIComponent": "1",
-                "step": "1",
-                "firstin": "1",
-                "off": "1",
-                "keyword4": "",
-                "code1": "",
-                "TYPEK2": "",
-                "checkbtn": "",
-                "queryName": "co_id",
-                "inpuType": "co_id",
-                "TYPEK": market,
-                "isnew": "false",
-                "co_id": stock_id,
-                "year": str(roc_year),
-                "month": str(month).zfill(2),
-            }
-            headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": "https://mops.twse.com.tw/mops/web/t21sc03",
-            }
-            r = requests.post(url, data=data, headers=headers, timeout=20)
-            r.encoding = "utf-8"
-            tbls = pd.read_html(StringIO(r.text), thousands=",")
-            for tbl in tbls:
-                # 橏選包含營收數字的表（至少 3 欄）
-                if tbl.shape[1] < 3 or tbl.shape[0] < 1:
-                    continue
-                # 尋找包含該股代號的行
-                strid = str(stock_id)
-                mask  = tbl.astype(str).apply(
-                    lambda row: row.str.contains(strid, regex=False).any(), axis=1
-                )
-                if not mask.any():
-                    continue
-                row = tbl[mask].iloc[0]
-                # 營收通常在最後幾欄，或標題含「營收」
-                for col in tbl.columns:
-                    if "營收" in str(col) and "當月" in str(col):
-                        try:
-                            val = float(str(row[col]).replace(",",""))
-                            if val > 0:
-                                return val
-                        except:
-                            pass
-                # 如果標題沒有「營收」，嘗試第 3~5 欄
-                for idx in range(2, min(6, tbl.shape[1])):
-                    try:
-                        val = float(str(row.iloc[idx]).replace(",",""))
-                        if val > 0:
-                            return val
-                    except:
-                        pass
-        except:
-            pass
-    return None
+    params = {
+        "dataset": "TaiwanStockMonthRevenue",
+        "data_id": stock_id,
+        "start_date": "2024-01-01",
+        "token": _FINMIND_TOKEN,
+    }
+    try:
+        r = requests.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params=params, timeout=20
+        )
+        data = r.json()
+        if data.get("status") == 200 and data.get("data"):
+            df = pd.DataFrame(data["data"])[["date", "revenue"]]
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            _FINMIND_REV_CACHE[stock_id] = df
+            return df
+    except:
+        pass
+    empty = pd.DataFrame(columns=["date", "revenue"])
+    _FINMIND_REV_CACHE[stock_id] = empty
+    return empty
+
+
+def get_revenue_for_month(stock_id: str, year_month: str) -> float | None:
+    """
+    取得指定年月的營收。
+    FinMind date 格式是 YYYY-MM-10 (每月 10 日公布)
+    """
+    df = fetch_revenue_finmind(stock_id)
+    if df.empty:
+        return None
+    ym = pd.Timestamp(year_month + "-01")
+    # 找對應年月的資料 (容許差 10 天)
+    mask = (df["date"].dt.year == ym.year) & (df["date"].dt.month == ym.month)
+    if not mask.any():
+        return None
+    return float(df[mask].iloc[0]["revenue"])
 
 
 def calc_rev_features(stock_id: str, as_of_period: str, rev_cache: dict) -> dict:
+    """
+    rev_cache 在這裡只用來記錄已處理過的 stock_id，避免重複請求
+    """
     as_of_dt    = pd.Timestamp(as_of_period + "-01")
     rev_month   = (as_of_dt - relativedelta(months=1)).strftime("%Y-%m")
     rev_month_2 = (as_of_dt - relativedelta(months=2)).strftime("%Y-%m")
     rev_month_3 = (as_of_dt - relativedelta(months=3)).strftime("%Y-%m")
     rev_yoy_m   = (as_of_dt - relativedelta(months=13)).strftime("%Y-%m")
 
+    # 確保已載入該股的 FinMind 資料
     if stock_id not in rev_cache:
-        rev_cache[stock_id] = {}
-    cache = rev_cache[stock_id]
+        fetch_revenue_finmind(stock_id)  # 預載到 _FINMIND_REV_CACHE
+        rev_cache[stock_id] = True
+        time.sleep(0.3)  # 防頂限流
 
-    def get_rev(ym):
-        if ym not in cache:
-            cache[ym] = fetch_revenue_mops(stock_id, ym)
-            time.sleep(0.4)
-        return cache[ym]
-
-    r0, r1, r2, ry = get_rev(rev_month), get_rev(rev_month_2), \
-                     get_rev(rev_month_3), get_rev(rev_yoy_m)
+    r0  = get_revenue_for_month(stock_id, rev_month)
+    r1  = get_revenue_for_month(stock_id, rev_month_2)
+    r2  = get_revenue_for_month(stock_id, rev_month_3)
+    ry  = get_revenue_for_month(stock_id, rev_yoy_m)
 
     return {
-        "rev_mom_1m": float(r0/r1 - 1)      if r0 and r1 and r1 > 0 else np.nan,
+        "rev_mom_1m": float(r0/r1 - 1)        if r0 and r1 and r1 > 0 else np.nan,
         "rev_mom_3m": float((r0/r2)**(1/3)-1) if r0 and r2 and r2 > 0 else np.nan,
-        "rev_yoy":    float(r0/ry - 1)       if r0 and ry and ry > 0  else np.nan,
+        "rev_yoy":    float(r0/ry - 1)         if r0 and ry and ry > 0  else np.nan,
     }
 
 
@@ -226,7 +217,11 @@ def calc_pit_features(closes, volumes, market, as_of):
 
 
 if __name__ == "__main__":
-    warnings.filterwarnings("ignore", category=RuntimeWarning)
+    if not _FINMIND_TOKEN:
+        print("提示: 未設定 FinMind token，使用存訪額度 (免費帳號每天 300 次)")
+        print("  若要增加限額：註冊 https://finmindtrade.com/ 後將 token 寫入 .finmind_token")
+    else:
+        print(f"FinMind token: {'*'*8}{_FINMIND_TOKEN[-4:]}")
 
     if not COOKIE_FILE.exists():
         print("[ERROR] 請先執行: python data/input_cookie.py")
@@ -301,13 +296,8 @@ if __name__ == "__main__":
     mkt.index = pd.to_datetime(mkt.index).tz_localize(None)
     print("  0050 OK")
 
-    rev_cache = json.loads(REV_CACHE.read_text(encoding="utf-8")) \
-        if REV_CACHE.exists() else {}
-    cached_cnt = sum(len(v) for v in rev_cache.values())
-    if cached_cnt:
-        print(f"\n營收快取: {cached_cnt} 筆")
-
-    print("\n計算各期 PIT 特徵 (含 MOPS 營收)...")
+    print("\n計算各期 PIT 特徵 (營收將從 FinMind 一次拉取)...")
+    rev_cache = {}  # 只記錄已處理過的 stock_id
     all_rows = []
     for period, holding_ids in sorted(period_holdings.items()):
         period_end = pd.Timestamp(period+"-01") + relativedelta(months=1) - timedelta(days=1)
@@ -330,8 +320,6 @@ if __name__ == "__main__":
             if in_etf: n1 += 1
             else:      n0 += 1
         print(f"  [{period}] in=1:{n1} in=0:{n0} | 營收OK:{rev_ok} 失敗:{rev_fail}")
-        REV_CACHE.write_text(
-            json.dumps(rev_cache, ensure_ascii=False, default=str), encoding="utf-8")
 
     full = pd.DataFrame(all_rows)
     hist_path = DATA_DIR / "holdings_history.csv"
