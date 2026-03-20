@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 """
-日頻模型回測系統 - Walk-Forward Out-of-Sample
+日頻模型回測系統 - Walk-Forward Out-of-Sample v2
 
-架構:
-  1. 將全部資料按時間切成 N 個 fold
-  2. 每個 fold: train = fold 開始之前所有資料, test = 此 fold 期間
-  3. 拼接每個 fold 的預測得到完整 OOS 曲線
-
-策略:
-  - 每日收盤後用 T 特徵預測 T+1 報酬
-  - 選 up_prob 前 5 名買入，權重等重
-  - T+1 收盤出場 (保持 1 天)
-  - 單日報酬上限 +9.7% / 下限 -3%
-  - 基準: 0050 實際日報酬
+選股逻輯改善:
+  - 綜合評分 score = up_prob - down_prob (排除双向高波動股)
+  - ATR 過濾: 排除當日宇宙中 atr_pct > 80th percentile 的股票
+  - top N 由 score 排序選出
 
 執行: python daily/backtest.py
 """
@@ -39,13 +32,7 @@ TOP_N            = 5
 STOP_LOSS        = -0.03
 UP_CAP           =  0.097
 COST_RT          = 0.001425
-
-FEATURE_COLS = [
-    "vol_ratio_5d", "vol_ratio_20d", "vol_zscore_20d",
-    "ret_1d", "ret_5d", "high_low_pct",
-    "close_vs_ma5", "close_vs_ma20",
-    "inst_net_ratio", "margin_chg_pct",
-]
+ATR_PCT_FILTER   = 0.80   # 排除 atr_pct > 80th percentile 的高波動股
 
 
 def load_feat_cols():
@@ -57,7 +44,6 @@ def load_feat_cols():
 
 
 def fetch_0050_returns(start: str, end: str) -> pd.Series:
-    """從 yfinance 拉 0050 日報酬，索引為日期"""
     print("下載 0050 基準資料...", end=" ", flush=True)
     h = yf.download("0050.TW",
                     start=(pd.Timestamp(start) - pd.Timedelta(days=5)).strftime("%Y-%m-%d"),
@@ -74,22 +60,26 @@ def fetch_0050_returns(start: str, end: str) -> pd.Series:
     return ret
 
 
-def train_fold(X_tr: pd.DataFrame, y_tr: np.ndarray):
+def train_fold(X_tr: pd.DataFrame, y_up: np.ndarray, y_dn: np.ndarray):
     try:
         import lightgbm as lgb
     except ImportError:
         print("[ERROR] pip install lightgbm"); sys.exit(1)
-    pos_rate  = y_tr.mean()
-    scale_pos = (1 - pos_rate) / pos_rate if pos_rate > 0 else 1.0
-    model = lgb.LGBMClassifier(
-        n_estimators=500, learning_rate=0.03,
-        num_leaves=31, max_depth=5,
-        min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
-        scale_pos_weight=scale_pos, class_weight="balanced",
-        random_state=42, n_jobs=-1, verbose=-1,
-    )
-    model.fit(X_tr, y_tr)
-    return model
+
+    def _fit(y):
+        pos_rate  = y.mean()
+        scale_pos = (1 - pos_rate) / pos_rate if pos_rate > 0 else 1.0
+        m = lgb.LGBMClassifier(
+            n_estimators=500, learning_rate=0.03,
+            num_leaves=31, max_depth=5,
+            min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
+            scale_pos_weight=scale_pos, class_weight="balanced",
+            random_state=42, n_jobs=-1, verbose=-1,
+        )
+        m.fit(X_tr, y)
+        return m
+
+    return _fit(y_up), _fit(y_dn)
 
 
 def summarize(trades_df, equity_df, n_folds, top_n):
@@ -121,6 +111,7 @@ def summarize(trades_df, equity_df, n_folds, top_n):
     print("Walk-Forward OOS 回測結果  (基準: 0050)")
     print(f"回測期間: {bt_s} ~ {bt_e}  Folds: {n_folds}")
     print(f"選股數: top {top_n}  停損: {STOP_LOSS*100:.0f}%  上限: {UP_CAP*100:.1f}%  每邊成本: {COST_RT*100:.4f}%")
+    print(f"ATR 過濾: >{ATR_PCT_FILTER*100:.0f}th pct 排除")
     print("="*55)
     print(f"總交易筆數    : {n_trades}")
     print(f"勝率         : {win_rate:.1f}%")
@@ -143,7 +134,7 @@ def summarize(trades_df, equity_df, n_folds, top_n):
         bm  =pd.NamedAgg("bm_ret",  lambda x: (1+x).prod()-1),
     )
     monthly["excess"] = monthly["port"] - monthly["bm"]
-    print("\n月分装報酬 (%) vs 0050:")
+    print("\n月分裝報酬 (%) vs 0050:")
     print((monthly * 100).round(2).to_string())
 
 
@@ -159,10 +150,10 @@ def run_backtest():
         print("[ERROR] 請先執行 python daily/build_features.py")
         sys.exit(1)
 
-    # 單日報酬 cap
     df["fwd_ret_1d"] = df["fwd_ret_1d"].clip(STOP_LOSS, UP_CAP)
 
     avail = [c for c in feat_cols if c in df.columns]
+    has_down = "label_down1" in df.columns
     df.dropna(subset=avail + ["label_up1", "fwd_ret_1d"], inplace=True)
 
     all_dates  = sorted(df["date"].unique())
@@ -170,10 +161,6 @@ def run_backtest():
     print(f"資料範圍: {all_dates[0].date()} ~ {all_dates[-1].date()} ({total_days} 交易日)")
 
     min_train_days = MIN_TRAIN_MONTHS * 21
-    if total_days <= min_train_days + N_FOLDS:
-        print("[ERROR] 資料太少")
-        sys.exit(1)
-
     bt_dates  = all_dates[min_train_days:]
     fold_size = len(bt_dates) // N_FOLDS
     folds = []
@@ -182,7 +169,6 @@ def run_backtest():
         e = (i+1)*fold_size if i < N_FOLDS-1 else len(bt_dates)
         folds.append((bt_dates[s], bt_dates[e-1]))
 
-    # 一次性下載 0050 回測期間內的日報酬
     bm_ret_series = fetch_0050_returns(
         str(folds[0][0].date()), str(folds[-1][1].date())
     )
@@ -203,27 +189,40 @@ def run_backtest():
         train_df = df[df["date"] < fold_start]
         test_df  = df[(df["date"] >= fold_start) & (df["date"] <= fold_end)]
 
-        X_tr  = pd.DataFrame(train_df[avail].values.astype(np.float32), columns=avail)
-        model = train_fold(X_tr, train_df["label_up1"].values)
+        X_tr = pd.DataFrame(train_df[avail].values.astype(np.float32), columns=avail)
+        up_model, dn_model = train_fold(
+            X_tr,
+            train_df["label_up1"].values,
+            train_df["label_down1"].values if has_down else np.zeros(len(train_df)),
+        )
         print(f"完成  (訓練 {len(X_tr):,} 筆 | 測試 {len(test_df):,} 筆)")
 
+        # 預先計算此 fold 的 atr_pct 80th percentile
+        atr_thresh = None
+        if "atr_pct" in test_df.columns:
+            atr_thresh = test_df["atr_pct"].quantile(ATR_PCT_FILTER)
+
         for dt in sorted(test_df["date"].unique()):
-            day_df = test_df[test_df["date"] == dt].dropna(subset=avail)
+            day_df = test_df[test_df["date"] == dt].dropna(subset=avail).copy()
+
+            # ATR 過濾: 排除當日高波動股
+            if atr_thresh is not None and "atr_pct" in day_df.columns:
+                day_df = day_df[day_df["atr_pct"] <= atr_thresh]
+
             if len(day_df) < TOP_N:
                 continue
 
             X_day = pd.DataFrame(day_df[avail].values.astype(np.float32), columns=avail)
-            day_df = day_df.copy()
-            day_df["up_prob"] = model.predict_proba(X_day)[:, 1]
+            day_df["up_prob"] = up_model.predict_proba(X_day)[:, 1]
+            day_df["dn_prob"] = dn_model.predict_proba(X_day)[:, 1]
+            # 綜合評分: 上漲機率 - 下跌機率
+            day_df["score"]   = day_df["up_prob"] - day_df["dn_prob"]
 
-            picks    = day_df.nlargest(TOP_N, "up_prob")
+            picks    = day_df.nlargest(TOP_N, "score")
             raw_rets = picks["fwd_ret_1d"].values
             adj_rets = raw_rets - COST_RT * 2
             port_ret = float(np.mean(adj_rets))
 
-            # 0050 基準報酬，對齊到同一交易日 (T+1)
-            dt_next = dt + pd.Timedelta(days=1)
-            # 找最接近的交易日
             bm_candidates = bm_ret_series[
                 (bm_ret_series.index >= dt) &
                 (bm_ret_series.index <= dt + pd.Timedelta(days=5))
@@ -250,6 +249,8 @@ def run_backtest():
                     "signal_date": dt,
                     "stock_id":    row["stock_id"],
                     "up_prob":     round(float(row["up_prob"]), 4),
+                    "dn_prob":     round(float(row["dn_prob"]), 4),
+                    "score":       round(float(row["score"]),   4),
                     "entry_close": round(float(row["close"]),  2),
                     "raw_ret":     round(r,     6),
                     "adj_ret":     round(r_adj, 6),
