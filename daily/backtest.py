@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-日頻模型回測系統 - Walk-Forward Out-of-Sample v10
+日頻模型回測系統 - Walk-Forward Out-of-Sample v7.1
 
-停損邏輯: 結構性停損 (Swing Low Breakdown)
-  - 進場時記錄進場前 SWING_LOOKBACK 日的最低收盤價為 swing_low
-  - 持有期間每日收盤 < swing_low 即認定多頭結構破壞，該日出場
-  - 沒觸及則續持到 HOLD_DAYS 到期
-  - 不設百分比上限停損，只用價格結構判斷
-
-其他:
+穩定版本 (基於 v7):
+  - 滑價 SLIPPAGE_RT=0.3%
+  - 流動性失敗 LIQUIDITY_FAIL=5%
+  - 起始資金 INIT_CAPITAL=10,000 NTD
   - MIN_SCORE=0.10 過濾低信心選股
-  - SLIPPAGE_RT / LIQUIDITY_FAIL / INIT_CAPITAL
+  - 不設停損，用總報酬 clip(STOP_LOSS, UP_CAP) 控制極端値
 
 執行: python daily/backtest.py
 """
@@ -26,7 +23,6 @@ import yfinance as yf
 ROOT      = Path(__file__).resolve().parent.parent
 DATA_DIR  = ROOT / "data"
 MODEL_DIR = ROOT / "models"
-RAW_CSV   = DATA_DIR / "daily_raw.csv"   # 需要 low 欄位
 
 IN_CSV     = DATA_DIR / "daily_features.csv"
 FEAT_JSON  = MODEL_DIR / "daily_feature_cols.json"
@@ -36,8 +32,8 @@ OUT_EQUITY = DATA_DIR / "backtest_equity.csv"
 N_FOLDS          = 6
 MIN_TRAIN_MONTHS = 12
 TOP_N            = 5
-SWING_LOOKBACK   = 5    # 進場前幾日最低價為 swing_low
-UP_CAP           = 0.097
+STOP_LOSS        = -0.03
+UP_CAP           =  0.097
 COST_RT          = 0.001425
 SLIPPAGE_RT      = 0.003
 LIQUIDITY_FAIL   = 0.05
@@ -53,43 +49,6 @@ def load_feat_cols():
         sys.exit(1)
     with open(FEAT_JSON) as f: meta = json.load(f)
     return meta["feature_cols"] if isinstance(meta, dict) else meta
-
-
-def load_raw_price() -> dict:
-    """讀取 daily_raw.csv 的 close/low 建立 per-stock lookup dict"""
-    if not RAW_CSV.exists():
-        print(f"[WARN] 找不到 {RAW_CSV}，將跨過結構性停損")
-        return {}
-    raw = pd.read_csv(RAW_CSV, parse_dates=["date"],
-                      usecols=["date", "stock_id", "close", "low"])
-    raw.sort_values(["stock_id", "date"], inplace=True)
-    result = {}
-    for sid, g in raw.groupby("stock_id"):
-        result[sid] = g.set_index("date")  # columns: close, low
-    return result
-
-
-def get_swing_low(price_dict: dict, sid, entry_date, lookback: int) -> float:
-    """進場日前 lookback 日的最低收盤價"""
-    if sid not in price_dict:
-        return -np.inf
-    g = price_dict[sid]
-    hist = g[g.index < entry_date]
-    if len(hist) < 1:
-        return -np.inf
-    return float(hist.iloc[-lookback:]["low"].min())
-
-
-def get_hold_closes(price_dict: dict, sid, hold_dates: list) -> dict:
-    """回傳持有期間每日 {date: close} dict"""
-    if sid not in price_dict:
-        return {}
-    g = price_dict[sid]
-    result = {}
-    for d in hold_dates:
-        if d in g.index:
-            result[d] = float(g.loc[d, "close"])
-    return result
 
 
 def fetch_0050_returns(start: str, end: str) -> pd.Series:
@@ -139,7 +98,6 @@ def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
     bm_ret_t   = equity_df["bm_cum_ret"].iloc[-1] * 100
     excess     = total_ret - bm_ret_t
     liq_fail_n = trades_df["liq_failed"].sum()
-    stopped_n  = trades_df["stopped"].sum()
 
     eq       = equity_df["cum_ret"].values + 1
     roll_max = np.maximum.accumulate(eq)
@@ -164,8 +122,7 @@ def summarize(trades_df, equity_df, n_folds, top_n, hold_days):
     print(f"回測期間: {pd.Timestamp(bt_s).date()} ~ {pd.Timestamp(bt_e).date()}  "
           f"({n_calendar_days}日/{n_years:.2f}年)  Folds: {n_folds}")
     print(f"選股數: top {top_n}  持有: {hold_days}天  MIN_SCORE: {MIN_SCORE}")
-    print(f"停損: 跌破進場前 {SWING_LOOKBACK}日最低價  交易成本: {(COST_RT+SLIPPAGE_RT)*100:.4f}%/邊")
-    print(f"流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  (共 {liq_fail_n} 筆)  結構性停損觸發: {stopped_n} 筆")
+    print(f"交易成本: {(COST_RT+SLIPPAGE_RT)*100:.4f}%/邊  流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  (共 {liq_fail_n} 筆)")
     print("="*60)
     print(f"起始資金      : {INIT_CAPITAL:,.0f} NTD")
     print(f"最終資金      : {final_capital:,.0f} NTD")
@@ -211,24 +168,18 @@ def run_backtest():
         print("[ERROR] 請先執行 python daily/build_features.py")
         sys.exit(1)
 
+    df["fwd_ret_1d"] = df["fwd_ret_1d"].clip(STOP_LOSS, UP_CAP)
+
     avail    = [c for c in feat_cols if c in df.columns]
     has_down = "label_down1" in df.columns
     df.dropna(subset=avail + ["label_up1", "fwd_ret_1d"], inplace=True)
-
-    print("載入 daily_raw.csv 價格資料...")
-    price_dict = load_raw_price()
-    use_struct_stop = len(price_dict) > 0
-    if use_struct_stop:
-        print(f"  結構性停損啟用: 停損=跌破進場前 {SWING_LOOKBACK}日最低收盤價")
-    else:
-        print("  [WARN] 結構性停損停用")
 
     all_dates  = sorted(df["date"].unique())
     total_days = len(all_dates)
     date_idx   = {d: i for i, d in enumerate(all_dates)}
     print(f"資料範圍: {all_dates[0].date()} ~ {all_dates[-1].date()} ({total_days} 交易日)")
-    print(f"持有天數: {HOLD_DAYS}天  MIN_SCORE: {MIN_SCORE}  SWING_LOOKBACK: {SWING_LOOKBACK}日")
-    print(f"滑價: {SLIPPAGE_RT*100:.2f}%  流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  起始資金: {INIT_CAPITAL:,} NTD")
+    print(f"持有天數: {HOLD_DAYS}天  MIN_SCORE: {MIN_SCORE}  滑價: {SLIPPAGE_RT*100:.2f}%")
+    print(f"流動性失敗: {LIQUIDITY_FAIL*100:.0f}%  起始資金: {INIT_CAPITAL:,} NTD")
 
     min_train_days = MIN_TRAIN_MONTHS * 21
     bt_dates  = all_dates[min_train_days:]
@@ -291,10 +242,8 @@ def run_backtest():
 
             picks = candidates.nlargest(min(TOP_N, len(candidates)), "up_prob")
 
-            raw_rets   = []
-            liq_flags  = []
-            stop_flags = []
-            swing_lows = []
+            raw_rets  = []
+            liq_flags = []
 
             for _, row in picks.iterrows():
                 sid = row["stock_id"]
@@ -303,69 +252,38 @@ def run_backtest():
                     fallback = carry_over.pop(sid, 0.0)
                     raw_rets.append(fallback)
                     liq_flags.append(1)
-                    stop_flags.append(0)
-                    swing_lows.append(np.nan)
                     continue
 
                 si = date_idx.get(dt)
                 if si is None:
-                    raw_rets.append(np.nan); liq_flags.append(0)
-                    stop_flags.append(0); swing_lows.append(np.nan); continue
+                    raw_rets.append(np.nan); liq_flags.append(0); continue
 
-                # 結構性停損: 進場前 N 日最低收盤價
-                swing_low = get_swing_low(price_dict, sid, dt, SWING_LOOKBACK)
-                swing_lows.append(swing_low)
+                exit_i  = min(si + HOLD_DAYS, len(all_dates) - 1)
+                hold_df = df[(df["stock_id"] == sid) &
+                             (df["date"] >  dt) &
+                             (df["date"] <= all_dates[exit_i])]
 
-                exit_i     = min(si + HOLD_DAYS, len(all_dates) - 1)
-                hold_dates = [all_dates[j] for j in range(si + 1, exit_i + 1)]
+                if hold_df.empty:
+                    raw_rets.append(float(row["fwd_ret_1d"])); liq_flags.append(0); continue
 
-                hold_feat = df[(df["stock_id"] == sid) &
-                               (df["date"].isin(hold_dates))].sort_values("date")
-                hold_close_dict = get_hold_closes(price_dict, sid, hold_dates)
-
-                cum     = 0.0
-                stopped = False
-
-                for d in hold_dates:
-                    # 結構判斷: 收盤 < swing_low 則結構破壞出場
-                    close_today = hold_close_dict.get(d)
-                    if use_struct_stop and close_today is not None \
-                            and swing_low > 0 and close_today < swing_low:
-                        # 總報酬 = 進場日到停損日的小計
-                        feat_rows = hold_feat[hold_feat["date"] <= d]
-                        cum = 0.0
-                        for _, fr in feat_rows.iterrows():
-                            cum = (1 + cum) * (1 + float(fr["fwd_ret_1d"])) - 1
-                        stopped = True
-                        break
-
-                    # 未觸及停損，繼續累積報酬
-                    feat_row = hold_feat[hold_feat["date"] == d]
-                    if not feat_row.empty:
-                        cum = (1 + cum) * (1 + float(feat_row.iloc[0]["fwd_ret_1d"])) - 1
-
-                cum = min(cum, UP_CAP * HOLD_DAYS)
+                cum = float((1 + hold_df["fwd_ret_1d"]).prod() - 1)
 
                 if rng.random() < LIQUIDITY_FAIL:
                     carry_over[sid] = cum
                     raw_rets.append(0.0)
                     liq_flags.append(1)
-                    stop_flags.append(int(stopped))
                 else:
                     carry_over.pop(sid, None)
                     raw_rets.append(cum)
                     liq_flags.append(0)
-                    stop_flags.append(int(stopped))
 
-            raw_rets   = np.array(raw_rets,   dtype=float)
-            liq_flags  = np.array(liq_flags,  dtype=int)
-            stop_flags = np.array(stop_flags, dtype=int)
-            valid      = ~np.isnan(raw_rets)
+            raw_rets  = np.array(raw_rets, dtype=float)
+            liq_flags = np.array(liq_flags, dtype=int)
+            valid     = ~np.isnan(raw_rets)
             if valid.sum() == 0: continue
 
             raw_rets_v = raw_rets[valid]
             liq_v      = liq_flags[valid]
-            stop_v     = stop_flags[valid]
 
             cost_per_trade = (COST_RT + SLIPPAGE_RT) * 2
             adj_rets = raw_rets_v - np.where(liq_v == 0, cost_per_trade, 0.0)
@@ -396,10 +314,9 @@ def run_backtest():
 
             valid_idx = np.where(valid)[0]
             for k, j in enumerate(valid_idx):
-                row_p  = picks.iloc[j]
-                r      = float(raw_rets_v[k])
-                r_adj  = r - (cost_per_trade if liq_v[k] == 0 else 0.0)
-                sl_val = swing_lows[j] if j < len(swing_lows) else np.nan
+                row_p = picks.iloc[j]
+                r     = float(raw_rets_v[k])
+                r_adj = r - (cost_per_trade if liq_v[k] == 0 else 0.0)
                 all_trades.append({
                     "fold":        fold_i + 1,
                     "signal_date": dt,
@@ -408,11 +325,9 @@ def run_backtest():
                     "dn_prob":     round(float(row_p["dn_prob"]), 4),
                     "score":       round(float(row_p["score"]),   4),
                     "entry_close": round(float(row_p["close"]),  2),
-                    "swing_low":   round(float(sl_val), 2) if not np.isnan(sl_val) else np.nan,
                     "raw_ret":     round(r,     6),
                     "adj_ret":     round(r_adj, 6),
                     "liq_failed":  int(liq_v[k]),
-                    "stopped":     int(stop_v[k]),
                 })
 
     trades_df = pd.DataFrame(all_trades)
