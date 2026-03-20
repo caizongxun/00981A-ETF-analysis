@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-每日收盤後執行，輸出今日異常名單
+每日收盤後執行 (建議 18:00+)，輸出明日候選股票
+
+預測架構:
+  X = 今日收盤後已知特徵 (T)
+  y = 明日報酬 > 2% / < -2% (T+1)
+
 執行: python daily/predict_today.py
 """
 import sys
 import json
 import pickle
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import numpy as np
@@ -28,6 +33,7 @@ OUT_TODAY  = DATA_DIR / "anomaly_today.csv"
 OUT_LOG    = DATA_DIR / "anomaly_log.csv"
 
 TOP_N = 20
+DATA_READY_HOUR = 18   # 三大法人/融資資料最早就緒時間
 
 
 def load_models():
@@ -38,32 +44,32 @@ def load_models():
     with open(UP_MODEL,   "rb") as f: up_m   = pickle.load(f)
     with open(DOWN_MODEL, "rb") as f: down_m = pickle.load(f)
     with open(FEAT_JSON)        as f: meta   = json.load(f)
-
-    # 相容新版 (dict) 與舊版 (list) FEAT_JSON
     if isinstance(meta, dict):
         feat_cols   = meta["feature_cols"]
         up_thresh   = meta.get("up_thresh",   0.45)
         down_thresh = meta.get("down_thresh", 0.45)
     else:
-        feat_cols   = meta
-        up_thresh   = 0.45
-        down_thresh = 0.45
-
+        feat_cols = meta; up_thresh = down_thresh = 0.45
     print(f"特徵數: {len(feat_cols)}  up_thresh={up_thresh:.2f}  down_thresh={down_thresh:.2f}")
     return up_m, down_m, feat_cols, up_thresh, down_thresh
 
 
+def check_data_readiness():
+    """18:00 前三大法人/融資資料尚未就緒，提示但不阻斷"""
+    now = datetime.now()
+    if now.hour < DATA_READY_HOUR:
+        print(f"\n[WARN] 現在 {now.strftime('%H:%M')}，三大法人/融資資料通常 18:00 後才就緒")
+        print(f"       建議收盤後 18:00+ 再執行，目前 inst_net_ratio/margin_chg_pct 可能為 NaN\n")
+
+
 def _squeeze(s):
-    """yfinance 新版可能回傳 MultiIndex DataFrame，強制轉為 1D Series"""
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
+    if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
     return s
 
 
 def fetch_recent_ohlcv(sym: str, lookback: int = 45) -> pd.DataFrame:
     h = yf.download(sym, period=f"{lookback}d", progress=False, auto_adjust=True)
-    if h.empty:
-        return pd.DataFrame()
+    if h.empty: return pd.DataFrame()
     if isinstance(h.columns, pd.MultiIndex):
         h.columns = h.columns.get_level_values(0)
     close  = _squeeze(h.get("Close",  h.iloc[:, 0]))
@@ -81,21 +87,24 @@ def fetch_recent_ohlcv(sym: str, lookback: int = 45) -> pd.DataFrame:
     })
 
 
-def compute_today_features(g: pd.DataFrame, inst_today: float = np.nan,
+def compute_features_today(g: pd.DataFrame, inst_net: float = np.nan,
                            margin_chg: float = np.nan) -> dict | None:
-    if len(g) < 21:
-        return None
+    """
+    計算今日特徵 (= T 的收盤資訊)
+    預測目標: 明日 (T+1) 報酬
+    """
+    if len(g) < 22: return None
     c  = g["close"].astype(float).reset_index(drop=True)
     v  = g["volume"].astype(float).reset_index(drop=True)
     h  = g["high"].astype(float).reset_index(drop=True)
     lo = g["low"].astype(float).reset_index(drop=True)
 
+    # 用最後一列 (= 今日收盤)
     ma5_v   = v.rolling(5,  min_periods=3).mean().iloc[-1]
     ma20_v  = v.rolling(20, min_periods=10).mean().iloc[-1]
     std20_v = v.rolling(20, min_periods=10).std().iloc[-1]
     vz20    = (v.iloc[-1] - v.rolling(20, min_periods=10).mean().iloc[-1]) / std20_v \
               if std20_v and std20_v != 0 else np.nan
-
     ret1  = float(c.iloc[-1] / c.iloc[-2] - 1) if len(c) >= 2 else np.nan
     ret5  = float(c.iloc[-1] / c.iloc[-6] - 1) if len(c) >= 6 else np.nan
     hlpct = float((h.iloc[-1] - lo.iloc[-1]) / c.iloc[-1]) if c.iloc[-1] != 0 else np.nan
@@ -111,47 +120,48 @@ def compute_today_features(g: pd.DataFrame, inst_today: float = np.nan,
         "high_low_pct":   hlpct,
         "close_vs_ma5":   float(c.iloc[-1] / ma5_c  - 1) if ma5_c  and ma5_c  != 0 else np.nan,
         "close_vs_ma20":  float(c.iloc[-1] / ma20_c - 1) if ma20_c and ma20_c != 0 else np.nan,
-        "inst_net_ratio": float(inst_today / ma20_v) if not np.isnan(inst_today) and ma20_v else np.nan,
+        "inst_net_ratio": float(inst_net / ma20_v) if not np.isnan(inst_net) and ma20_v else np.nan,
         "margin_chg_pct": float(margin_chg) if not np.isnan(margin_chg) else np.nan,
     }
 
 
 def main():
+    check_data_readiness()   # 18:00 前提示
+
     up_m, down_m, feat_cols, up_thresh, down_thresh = load_models()
     client = get_client()
     today  = date.today().strftime("%Y-%m-%d")
     start  = (pd.Timestamp(today) - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
 
-    print(f"預測日期: {today}")
+    print(f"以今日 ({today}) 收盤資訊預測明日候選...")
     print(f"確認 yfinance 後綴...")
     valid = {}
     for tk in UNIVERSE:
         r = get_valid_symbol(tk)
-        if r:
-            valid[tk] = r[0]
+        if r: valid[tk] = r[0]
     print(f"有效宇宙: {len(valid)} 支")
 
     rows = []
+    null_inst = null_margin = 0
     for i, (tk, sym) in enumerate(valid.items()):
         g = fetch_recent_ohlcv(sym)
-        if g.empty or len(g) < 21:
-            continue
+        if g.empty or len(g) < 22: continue
 
-        inst_today = np.nan
+        # 三大法人今日
+        inst_net = np.nan
         try:
             inst_rows = client.get("TaiwanStockInstitutionalInvestorsBuySell", tk, start)
             if inst_rows:
                 idf = pd.DataFrame(inst_rows)
                 idf["date"] = pd.to_datetime(idf["date"])
-                today_inst = idf[idf["date"].dt.strftime("%Y-%m-%d") == today]
-                if not today_inst.empty and {"buy", "sell"}.issubset(idf.columns):
-                    inst_today = float(
-                        today_inst["buy"].astype(float).sum() -
-                        today_inst["sell"].astype(float).sum()
-                    )
-        except Exception:
-            pass
+                td = idf[idf["date"].dt.strftime("%Y-%m-%d") == today]
+                if not td.empty and {"buy", "sell"}.issubset(idf.columns):
+                    inst_net = float(td["buy"].astype(float).sum() -
+                                     td["sell"].astype(float).sum())
+        except Exception: pass
+        if np.isnan(inst_net): null_inst += 1
 
+        # 融資
         margin_chg = np.nan
         try:
             m_rows = client.get("TaiwanStockMarginPurchaseShortSale", tk, start)
@@ -159,16 +169,15 @@ def main():
                 mdf = pd.DataFrame(m_rows)
                 mdf["date"] = pd.to_datetime(mdf["date"])
                 if {"MarginPurchaseBuy", "MarginPurchaseSell"}.issubset(mdf.columns):
-                    mdf["net"] = mdf["MarginPurchaseBuy"].astype(float) - mdf["MarginPurchaseSell"].astype(float)
+                    mdf["net"] = mdf["MarginPurchaseBuy"].astype(float) - \
+                                 mdf["MarginPurchaseSell"].astype(float)
                     margin_chg = float(mdf["net"].tail(5).sum())
-        except Exception:
-            pass
+        except Exception: pass
+        if np.isnan(margin_chg): null_margin += 1
 
-        feat = compute_today_features(g, inst_today, margin_chg)
-        if feat is None:
-            continue
+        feat = compute_features_today(g, inst_net, margin_chg)
+        if feat is None: continue
 
-        # 用 DataFrame 傳入，避免 sklearn feature name warning
         X = pd.DataFrame([[feat.get(c, np.nan) for c in feat_cols]], columns=feat_cols)
         up_prob   = float(up_m.predict_proba(X)[0, 1])
         down_prob = float(down_m.predict_proba(X)[0, 1])
@@ -182,27 +191,33 @@ def main():
             **{k: round(float(fv), 4) if not (isinstance(fv, float) and np.isnan(fv)) else None
                for k, fv in feat.items()},
         })
-
         if (i + 1) % 30 == 0:
             print(f"  [{i+1}/{len(valid)}]")
 
+    # 資料完整性報告
+    total = len(valid)
+    print(f"\n資料完整性: inst_net 缺失 {null_inst}/{total} | margin 缺失 {null_margin}/{total}")
+    if null_inst > total * 0.5:
+        print("[WARN] 超過半數股票缺少三大法人資料，建議 18:00+ 後重跟")
+
     result = pd.DataFrame(rows)
     if result.empty:
-        print("[WARN] 今日無資料")
-        return
+        print("[WARN] 今日無資料"); return
 
     result.sort_values("up_prob", ascending=False, inplace=True)
     result.to_csv(OUT_TODAY, index=False, encoding="utf-8-sig")
 
-    print(f"\n=== 今日異常上漲候選 (top {TOP_N}, 閾值>{up_thresh:.2f}) ===")
-    up_cands  = result[result["up_prob"] > up_thresh]
-    show_up   = [c for c in ["stock_id","up_prob","vol_ratio_20d","inst_net_ratio","close"] if c in result.columns]
+    print(f"\n=== 明日上漲候選 (top {TOP_N}, 閾値>{up_thresh:.2f}) ===")
+    up_cands = result[result["up_prob"] > up_thresh]
+    show_up  = [c for c in ["stock_id","up_prob","vol_ratio_20d","inst_net_ratio","ret_1d","close"]
+                if c in result.columns]
     print(up_cands[show_up].head(TOP_N).to_string(index=False))
 
-    print(f"\n=== 今日異常下跌候選 (top {TOP_N}, 閾值>{down_thresh:.2f}) ===")
+    print(f"\n=== 明日下跌候選 (top {TOP_N}, 閾値>{down_thresh:.2f}) ===")
     down_cands = result.sort_values("down_prob", ascending=False)
     down_cands = down_cands[down_cands["down_prob"] > down_thresh]
-    show_down  = [c for c in ["stock_id","down_prob","vol_ratio_20d","close"] if c in result.columns]
+    show_down  = [c for c in ["stock_id","down_prob","vol_ratio_20d","ret_1d","close"]
+                  if c in result.columns]
     print(down_cands[show_down].head(TOP_N).to_string(index=False))
 
     if OUT_LOG.exists():
